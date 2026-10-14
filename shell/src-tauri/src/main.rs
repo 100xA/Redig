@@ -422,6 +422,20 @@ fn drag_out(window: tauri::WebviewWindow, path: String, icon: Option<String>) ->
         .map_err(|error| error.to_string())
 }
 
+/// The licenses of what DigUp ships (THIRD-PARTY-NOTICES.txt, which the packages put beside the app; dev builds
+/// have none).
+fn licenses_file(app: &AppHandle) -> Option<PathBuf> {
+    let file = app.path().resource_dir().ok()?.join("THIRD-PARTY-NOTICES.txt");
+    file.is_file().then_some(file)
+}
+
+/// Settings → Storage → Licenses: the notices, in the system's text viewer.
+#[tauri::command]
+fn open_licenses(app: AppHandle) -> Result<(), String> {
+    let file = licenses_file(&app).ok_or("this build has no license notices")?;
+    app.opener().open_path(file.display().to_string(), None::<&str>).map_err(|error| error.to_string())
+}
+
 /// Shows a result in the file manager, selected.
 #[tauri::command]
 fn reveal(app: AppHandle, path: String) -> Result<(), String> {
@@ -613,7 +627,7 @@ fn main() {
             app_state, open_window, open_settings, choose_folders, index_now, quit_app, close_window, pause_indexing,
             remove_folder, set_skipped, set_skip_types, set_index_hours, code_setup_info, set_code_folders, choose_code_folders,
             remove_code_folder, turn_off_code, set_code_editor, window_resized, copy_file, drag_out, set_hotkey, hold_hotkey,
-            set_tray_click, check_for_updates, offer_update, set_update_checks
+            set_tray_click, check_for_updates, offer_update, set_update_checks, open_licenses
         ])
         .build(tauri::generate_context!())
         .expect("DigUp couldn't start");
@@ -1201,6 +1215,7 @@ fn settings_info(app: AppHandle, shell: State<'_, Arc<Shell>>) -> Value {
         "updateChecks": !settings.update_checks_off,
         "installsUpdates": updates::installs_itself(),
         "version": app.package_info().version.to_string(),
+        "licenses": licenses_file(&app).is_some(),
         "debug": shell.options.debug_settings,
     })
 }

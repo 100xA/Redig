@@ -72,6 +72,8 @@ function renderUpdates() {
     : update.state === "installing" ? `Installing DigUp ${update.version}…` : `DigUp ${update.version} is available`;
 }
 
+$("licenses").onclick = () => invoke("open_licenses").catch(fail);
+
 $("update-version").onclick = () => {
   if (info.state && info.state.update) invoke("offer_update").catch(fail);
 };
@@ -392,6 +394,7 @@ function renderStorage() {
   $("index-size").textContent = bytes(storage.indexBytes || 0) + (storage.codeBytes ? ` (code ${bytes(storage.codeBytes)})` : "");
   pathButton($("index-path"), storage.index);
   $("version").textContent = `DigUp ${info.version || ""} · EmbeddingGemma 2 by Google (Apache 2.0), run by llama.cpp (MIT).`;
+  $("licenses").hidden = !info.licenses;
 }
 
 /// A folder's path; a click shows it in the file manager.

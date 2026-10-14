@@ -49,11 +49,14 @@ if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   fi
   signing=',"createUpdaterArtifacts":true'
 fi
+# The license of everything the packages carry, beside the app (and the .deb's copyright file, below).
+python3 scripts/notices.py linux shell/src-tauri/THIRD-PARTY-NOTICES.txt
 # Packages of an earlier build (another version) would be taken for this one's.
 rm -rf shell/src-tauri/target/release/bundle/deb shell/src-tauri/target/release/bundle/appimage
 # The helper folder goes in as the packages' resources here only: Tauri checks resources on every build.
+resources='{"helper/":"helper/","THIRD-PARTY-NOTICES.txt":"THIRD-PARTY-NOTICES.txt"}'
 (cd shell/src-tauri && "${tauri[@]}" build --bundles deb,appimage \
-  --config "{\"bundle\":{\"resources\":{\"helper/\":\"helper/\"}$signing}}")
+  --config "{\"bundle\":{\"resources\":$resources$signing}}")
 
 # Packed again with xz (Tauri's gzip makes it 51 MB, xz 32). Its name stays "dig-up" (Tauri's spelling of the product's
 # name): Debian and Ubuntu already have a "digup" (a digest updating tool), which would replace DigUp at the next update.
@@ -61,6 +64,8 @@ deb=$(ls shell/src-tauri/target/release/bundle/deb/*.deb)
 repack=$(mktemp -d)
 chmod 755 "$repack"   # the package's root: mktemp's 700 would ship as /'s mode
 dpkg-deb -R "$deb" "$repack"
+mkdir -p "$repack/usr/share/doc/dig-up"
+cp shell/src-tauri/THIRD-PARTY-NOTICES.txt "$repack/usr/share/doc/dig-up/copyright"   # where Debian looks for it
 dpkg-deb --root-owner-group -Zxz -b "$repack" "$deb" > /dev/null
 rm -rf "$repack"
 rm -f "$deb.sig"   # signed before the repacking, so no longer its signature (a .deb doesn't update itself anyway)

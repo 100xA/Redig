@@ -30,6 +30,10 @@ else
     echo "$missing"
     exit 1
   fi
+  # The licenses of what the package carries: beside the app, and where Debian keeps a package's.
+  for notices in "$(dirname "$app")/../lib/DigUp/THIRD-PARTY-NOTICES.txt" "$(dirname "$app")/../share/doc/dig-up/copyright"; do
+    grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$notices" || { echo "no license notices in $notices"; exit 1; }
+  done
 fi
 
 mkdir -p "$work/files"

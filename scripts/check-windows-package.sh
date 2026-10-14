@@ -19,6 +19,8 @@ echo "installing $setup"
 MSYS_NO_PATHCONV=1 "$setup" /S
 installed=$(cygpath -u "$LOCALAPPDATA")/DigUp
 ls "$installed/DigUp.exe" "$installed/helper/digup.exe" > /dev/null
+# The licenses of what the installer carries, beside the app.
+grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$installed/THIRD-PARTY-NOTICES.txt" || { echo "no license notices"; exit 1; }
 
 mkdir -p "$work/files"
 cp Tests/LlamaRuntimeTests/Reference/photo.jpg Tests/LlamaRuntimeTests/Reference/screen.png \

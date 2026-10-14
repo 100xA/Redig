@@ -2,8 +2,8 @@
 # Builds DigUp's Windows installer: the Tauri shell (shell/) with DigUp's helper, llama.cpp, PDFium, the Swift and C++
 # runtimes and ffmpeg in its helper folder, as an NSIS installer that installs for the current user (no admin prompt).
 # Run it in Git for Windows' bash inside a Visual Studio developer environment, after scripts/fetch-vendor.sh,
-# scripts/build-llama.sh and scripts/build-ffmpeg.sh (that one in MSYS2's MINGW64 shell). Needs Swift, Rust and Node
-# (for Tauri's CLI):
+# scripts/build-llama.sh and scripts/build-ffmpeg.sh (that one in MSYS2's MINGW64 shell). Needs Swift, Rust, Python and
+# Node (for Tauri's CLI):
 #   scripts/package-windows.sh      → shell/src-tauri/target/release/bundle/nsis/
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,9 +37,14 @@ if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
   fi
   signing=',"createUpdaterArtifacts":true'
 fi
+# The license of everything the installer carries, installed beside the app. (python3 can be the Store's stub.)
+python=python3
+python3 -c '' 2> /dev/null || python=python
+"$python" scripts/notices.py windows shell/src-tauri/THIRD-PARTY-NOTICES.txt
 # Installers of an earlier build (another version) would be taken for this one's.
 rm -rf shell/src-tauri/target/release/bundle/nsis
 # The helper folder goes in as the installer's resources here only: Tauri checks resources on every build.
+resources='{"helper/":"helper/","THIRD-PARTY-NOTICES.txt":"THIRD-PARTY-NOTICES.txt"}'
 (cd shell/src-tauri && npx --yes "@tauri-apps/cli@$TAURI_CLI" build --bundles nsis \
-  --config "{\"bundle\":{\"resources\":{\"helper/\":\"helper/\"}$signing}}")
+  --config "{\"bundle\":{\"resources\":$resources$signing}}")
 ls -la shell/src-tauri/target/release/bundle/nsis/
