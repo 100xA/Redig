@@ -66,6 +66,9 @@ chmod 755 "$repack"   # the package's root: mktemp's 700 would ship as /'s mode
 dpkg-deb -R "$deb" "$repack"
 mkdir -p "$repack/usr/share/doc/dig-up"
 cp shell/src-tauri/THIRD-PARTY-NOTICES.txt "$repack/usr/share/doc/dig-up/copyright"   # where Debian looks for it
+# A beta's version as Debian sorts it before the release: 0.7.0~beta.1 (Debian reads 0.7.0-beta.1 as 0.7.0's revision
+# beta.1, newer than 0.7.0 itself).
+sed -i -E 's/^(Version: [0-9]+\.[0-9]+\.[0-9]+)-/\1~/' "$repack/DEBIAN/control"
 dpkg-deb --root-owner-group -Zxz -b "$repack" "$deb" > /dev/null
 rm -rf "$repack"
 rm -f "$deb.sig"   # signed before the repacking, so no longer its signature (a .deb doesn't update itself anyway)
