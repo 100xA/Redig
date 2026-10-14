@@ -258,6 +258,11 @@ function renderPreview() {
         + "code by what it does."));
     } else if (state.phase === "codeHint") {
       $preview.append(message("Search your code", "Say what the code does, or type a name that's in it."));
+    } else if (state.phase === "words") {
+      // The words are in and the meaning results on their way (as on the Mac): no verdict yet.
+      const box = element("div", "message");
+      box.append(element("span", "", "Searching…"));
+      $preview.append(box);
     } else if (state.indexing) {
       const { done, total } = state.indexing;
       $preview.append(message("Nothing yet", `Still indexing (${done} of ${total} files). Until a file is read, `
