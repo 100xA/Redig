@@ -1,9 +1,11 @@
 #!/bin/bash
-# Linux: ffmpeg and ffprobe for DigUp's packages, built small: LGPL, static, decoding only what people keep (common audio
-# and video, and HEIC, WebP, TIFF and AVIF pictures), writing only what the engine asks for (16 kHz PCM, JPEG frames,
-# PPM pictures). AV1 and AVIF decode with dav1d, built here too. → Vendor/ffmpeg/bin (out of git). Does nothing when
-# the pinned versions are already built. Needs a C compiler, make, meson and ninja, pkg-config, zlib's headers, and
-# nasm on x86_64.
+# Linux and Windows: ffmpeg and ffprobe for DigUp's packages, built small: LGPL, static, decoding only what people keep
+# (common audio and video, and HEIC, WebP, TIFF and AVIF pictures), writing only what the engine asks for (16 kHz PCM,
+# JPEG frames, PPM pictures). AV1 and AVIF decode with dav1d, built here too, and zlib is linked in: those three are
+# all the licenses it carries (their texts land in Vendor/ffmpeg/licenses for the packages' notices). → Vendor/ffmpeg/bin
+# (out of git). Does nothing when the pinned versions are already built. Needs a C compiler, make, meson and ninja,
+# pkg-config, zlib's headers, and nasm on x86_64; on Windows, MSYS2's MINGW64 shell with its gcc, meson, ninja, nasm,
+# pkgconf and zlib (the executables then need no DLLs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FFMPEG_VERSION=9.0.2
@@ -45,9 +47,13 @@ parsers=(h264 hevc mpeg4video mpegvideo vp8 vp9 av1 aac aac_latm mpegaudio flac 
 filters=(buffer buffersink abuffer abuffersink null anull format aformat aresample scale fps crop pad overlay xstack
   hstack vstack transpose hflip vflip rotate setsar setdar copy trim atrim)
 
+# Windows (MinGW): the C runtime linked in, so ffmpeg.exe and ffprobe.exe run without MinGW's DLLs.
+static=()
+case "$(uname -s)" in MINGW*|MSYS*) static=(--extra-ldflags=-static) ;; esac
+
 echo "ffmpeg $FFMPEG_VERSION"
 (cd "$T/ffmpeg-$FFMPEG_VERSION" &&
-  PKG_CONFIG_PATH="$T/deps/lib/pkgconfig" ./configure --prefix="$OUT" --pkg-config-flags=--static \
+  PKG_CONFIG_PATH="$T/deps/lib/pkgconfig" ./configure --prefix="$OUT" --pkg-config-flags=--static "${static[@]}" \
     --disable-everything --disable-autodetect --disable-network --disable-doc --disable-debug --disable-ffplay \
     --enable-static --disable-shared --enable-zlib --enable-libdav1d \
     --enable-protocol=file,pipe \
@@ -59,6 +65,11 @@ echo "ffmpeg $FFMPEG_VERSION"
   ! grep "did not match anything" "$T/configure.log" &&
   make -j"$(nproc)" > "$T/make.log" 2>&1 &&
   make install > /dev/null)
+mkdir -p "$OUT/licenses"
+cp "$T/ffmpeg-$FFMPEG_VERSION/COPYING.LGPLv2.1" "$OUT/licenses/ffmpeg-COPYING.LGPLv2.1"
+cp "$T/ffmpeg-$FFMPEG_VERSION/LICENSE.md" "$OUT/licenses/ffmpeg-LICENSE.md"
+cp "$T/dav1d-$DAV1D_VERSION/COPYING" "$OUT/licenses/dav1d-COPYING"
+"$OUT/bin/ffmpeg" -hide_banner -version > "$OUT/licenses/ffmpeg-version.txt"
 rm -rf "$OUT/include" "$OUT/lib" "$OUT/share" "$T"
 echo "$STAMP" > "$OUT/BUILD"
 ls -la "$OUT/bin"

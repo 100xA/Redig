@@ -70,6 +70,10 @@ jobs:
           echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=$sdk:$sdk/lib/VulkanLoader" >> "$GITHUB_ENV"
           echo "$sdk/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Vendor/ffmpeg
+          key: ffmpeg-linux-${{ hashFiles('scripts/build-ffmpeg.sh') }}
       - name: Build
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1   # Tauri's AppImage tools are AppImages, and a container has no FUSE
@@ -153,6 +157,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
+      # The small ffmpeg is built once per version of its build script (build-ffmpeg.sh does nothing when it's there).
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: ffmpeg
+        with:
+          path: Vendor/ffmpeg
+          key: ffmpeg-windows-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        with:
+          msystem: MINGW64
+          release: false   # the runner's own MSYS2
+          update: true
+          install: >-
+            make mingw-w64-x86_64-gcc mingw-w64-x86_64-meson mingw-w64-x86_64-ninja mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-zlib
+      - name: ffmpeg
+        # The small LGPL ffmpeg the installer carries (as the Linux packages do): only what DigUp reads, so its licenses
+        # are FFmpeg's, dav1d's and zlib's. Built with MSYS2's MinGW compilers, before the MSVC environment.
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: scripts/build-ffmpeg.sh
       - uses: compnerd/gha-setup-swift@bbae8ce86bac5a3449f3992b3d88bc4ca25f2057 # v0.5.0
         with:
           swift-version: swift-6.4.0-release
@@ -174,17 +199,9 @@ jobs:
         run: |
           # MSVC's tools before Git's: Git's /usr/bin/link (coreutils) would stand in for link.exe.
           export PATH="$(dirname "$(command -v cl)"):$PATH"
-          # ffmpeg: BtbN's LGPL build with its DLLs, one dated build: a month's last, which BtbN keeps (the other
-          # daily builds go after two weeks).
-          ffmpeg=ffmpeg-n9.0.2-17-g2a571b6068-win64-lgpl-shared-9.0
-          temp=$(cygpath -u "$RUNNER_TEMP")
-          curl -fsSL -o "$temp/ffmpeg.zip" \
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/$ffmpeg.zip"
-          echo "7157177b8a6cb2174c1650ba8c71b363f2c78cba5330f88c4c02cf5b2b880646  $temp/ffmpeg.zip" | sha256sum -c -
-          unzip -q "$temp/ffmpeg.zip" -d "$temp"
           scripts/fetch-vendor.sh
           scripts/build-llama.sh
-          FFMPEG="$temp/$ffmpeg/bin" scripts/package-windows.sh
+          scripts/package-windows.sh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
