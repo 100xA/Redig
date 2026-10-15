@@ -16,4 +16,6 @@ let package = Package(name: "DigUpEngineChecks", platforms: [.macOS(.v14)], targ
     .testTarget(name: "DigUpKitTests", dependencies: ["DigUpKit"], exclude: ["Pictures", "Videos"]),
 ])
 SWIFT
-swift test --package-path "$TASK_DIR" --build-system native "$@"
+# The synchronous indexer waits for async AVFoundation work. Match its production GCD usage by avoiding
+# concurrent blocking test bodies that can exhaust Swift's cooperative executor on small CI runners.
+swift test --package-path "$TASK_DIR" --build-system native --no-parallel "$@"
