@@ -4,12 +4,13 @@ import Observation
 import SwiftUI
 
 enum SettingsTab: String, CaseIterable {
-    case general, folders, code, storage
+    case general, folders, organizer, code, storage
 
     var title: String {
         switch self {
         case .general: "General"
         case .folders: "Folders"
+        case .organizer: "Organizer"
         case .code: "Code"
         case .storage: "Storage"
         }
@@ -19,6 +20,7 @@ enum SettingsTab: String, CaseIterable {
         switch self {
         case .general: "gearshape"
         case .folders: "folder"
+        case .organizer: "square.grid.2x2"
         case .code: "chevron.left.forwardslash.chevron.right"
         case .storage: "internaldrive"
         }
@@ -181,6 +183,7 @@ private struct SettingsPane: View {
                 switch tab {
                 case .general: GeneralSettings(state: state)
                 case .folders: FolderSettings(state: state)
+                case .organizer: OrganizerView(organizer: state.app.organizer)
                 case .code: CodeSettings(state: state)
                 case .storage: StorageSettings(state: state)
                 }

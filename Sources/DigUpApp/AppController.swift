@@ -14,6 +14,7 @@ final class AppController {
     let download: ModelDownload
     let hotkeys = HotkeyCenter()
     let updates: Updates
+    lazy var organizer = OrganizerController(app: self)
     private let power: PowerPolicy
     private let schedule: IndexSchedule
     private(set) var panel: SearchPanelController!
@@ -63,6 +64,7 @@ final class AppController {
         statusMenu = StatusMenuController(model: model)
         statusMenu.onSearch = { [weak self] in self?.panel.show() }
         statusMenu.onOpenWindow = { [weak self] in self?.showSearchWindow() }
+        statusMenu.onOrganizer = { [weak self] in self?.showSettings(.organizer) }
         statusMenu.onSettings = { [weak self] in self?.showSettings() }
         statusMenu.onChooseFolders = { [weak self] in self?.chooseFolders() }
         statusMenu.onPauseChanged = { [weak self] paused in self?.engine.setPaused(paused) }
@@ -85,6 +87,7 @@ final class AppController {
         CodeEditor.current = CodeEditor.chosen(model.settings.codeEditor)
         download.onReady = { [weak self] in self?.engine.modelArrived() }
         engine.start()
+        organizer.start()
         let settings = model.settings
         if !settings.onboarded, settings.roots.isEmpty {
             showOnboarding()
@@ -137,6 +140,7 @@ final class AppController {
         model.settings.excludedFolders = excluded
         model.settings.excludedTypes = types
         engine.setFolders(roots: roots, excluded: excluded, excludedTypes: types)
+        organizer.configurationChanged()
     }
 
     func removeFolder(_ root: URL) {
@@ -147,6 +151,7 @@ final class AppController {
         AppSettings.save(excludedFolders: folders)
         model.settings.excludedFolders = folders
         engine.setFolders(roots: model.settings.roots, excluded: folders, excludedTypes: model.settings.excludedTypes)
+        organizer.configurationChanged()
     }
 
     /// File extensions never to index ("heic, .txt"); files of those types already indexed leave the index.
@@ -156,6 +161,7 @@ final class AppController {
         AppSettings.save(excludedTypes: types)
         model.settings.excludedTypes = types
         engine.setFolders(roots: model.settings.roots, excluded: model.settings.excludedFolders, excludedTypes: types)
+        organizer.configurationChanged()
     }
 
     // MARK: Code search

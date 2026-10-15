@@ -5,8 +5,9 @@
 > **Independent efficiency fork by [100xA](https://github.com/100xA).**
 > DigUp was created by **[Abdur Rahim (ARahim3)](https://github.com/ARahim3/DigUp)**. The original app, search
 > engine, interface and documentation are his work, shared under the [MIT license](LICENSE). This fork adds
-> performance improvements, consistency fixes and a new minimal icon. Upstream copyright and dependency notices
-> are preserved. See [the fork's changes and validation](docs/EFFICIENCY.md).
+> performance improvements, consistency fixes, a local Mac file organizer and a new minimal icon. Upstream copyright
+> and dependency notices are preserved. See [the efficiency changes](docs/EFFICIENCY.md) and
+> [the Mac organizer](docs/ORGANIZER.md).
 
 <p align="center"><b>Describe it. Dig it up.</b><br>
 Search the files on your computer by what's in them, with Google DeepMind's
@@ -44,6 +45,21 @@ so a search gets both the meaning and the exact string. On a Mac that includes t
 
 Nothing you index leaves your computer. DigUp goes online to download the model once. Upstream release builds also
 check for updates once a day; these checks are disabled in this source fork. No account, no telemetry.
+
+## Local organizer for Mac
+
+Open **Organize Files…** from the menu bar, or **Settings → Organizer**, and choose **Use Downloads, Desktop &
+Documents**. DigUp groups indexed files into project collections using its existing local embeddings. A download can
+match a project in Documents or Desktop. You can rename collections and correct uncertain matches without moving files.
+
+Use **File** to move an individual match into its project folder, or enable **File strong matches automatically**.
+Automatic filing handles settled, loose files with a clear match to an established project. Uncertain files stay for
+review. Each move is recorded on disk; **Undo** restores an unchanged file when its original location is free, including
+after restarting the app. Returned files are excluded from automatic refiling.
+
+Folder setup and automatic filing are off on a fresh installation. This first version organizes the file types DigUp
+can index; it does not rearrange code repositories, apps, archives or cloud-only placeholders. Everything runs locally
+after the existing model download. See [setup, behavior and recovery details](docs/ORGANIZER.md).
 
 ## Install
 
@@ -127,7 +143,8 @@ Outside the folders you pick for code search, it never reads code, and inside a 
 `package.json` and the like) it reads only screenshots. It never reads keys, certificates, password files, hidden
 folders like `.ssh`, apps or caches. It skips folders that look like datasets, and never downloads files that only
 live in the cloud (iCloud on a Mac, OneDrive on Windows). You can skip more folders or file types in Settings. DigUp
-only reads your files; it never changes, moves or uploads them.
+searches your files without modifying their contents or uploading them. On Mac, the optional organizer can move files
+under the folders you enable, with a persistent undo history.
 
 The first pass happens once. On a Mac it takes a few minutes for a few hundred files and can take an hour for a big
 Downloads folder. On Windows and Linux, DigUp runs the model on the graphics card where that's faster and on the

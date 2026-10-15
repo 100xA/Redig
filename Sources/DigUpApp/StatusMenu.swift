@@ -53,6 +53,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     var onSearch: () -> Void = {}
     var onOpenWindow: () -> Void = {}
+    var onOrganizer: () -> Void = {}
     var onSettings: () -> Void = {}
     var onChooseFolders: () -> Void = {}
     var onPauseChanged: (Bool) -> Void = { _ in }
@@ -119,6 +120,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
         menu.addItem(search)
         menu.addItem(ActionMenuItem("Open DigUp") { [weak self] in self?.onOpenWindow() })
+        menu.addItem(ActionMenuItem("Organize Files…") { [weak self] in self?.onOrganizer() })
         if model.hasFolders {
             menu.addItem(.separator())
             let paused = model.status.paused

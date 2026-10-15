@@ -308,6 +308,11 @@ nonisolated final class Engine: @unchecked Sendable {
         indexQueue.async { [self] in requestSync() }
     }
 
+    /// A journaled organizer operation changed paths. Catch up without waiting for an FSEvents delivery.
+    func filesOrganized() {
+        indexQueue.async { [self] in requestSync() }
+    }
+
     /// A drive was connected or ejected: a missing folder may be back (or gone).
     func volumesChanged() {
         let folders = lock.withLock { (roots, excluded, codeRoots, codeExcluded) }
