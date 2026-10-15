@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds build.noindex/DigUp.app, signed with the hardened runtime (as releases are, so dev builds behave the same).
+# Builds build.noindex/Redig.app, signed with the hardened runtime (as releases are, so dev builds behave the same).
 #   ./build.sh                       signed with the identity named in .sign-id (one line, gitignored), so macOS keeps
 #                                    folder permissions across rebuilds; ad-hoc without it (macOS then asks again
 #                                    after each build)
@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="DigUp"
+APP_NAME="Redig"
 # ".noindex" keeps Spotlight (and the Apps list) from showing this staging copy.
 BUILD_DIR="${BUILD_DIR:-build.noindex}"
 APP="$BUILD_DIR/$APP_NAME.app"
@@ -28,7 +28,7 @@ fi
 scripts/build-llama.sh
 
 # Both executables: the app, and the `digup` CLI, which the app runs as its indexing helper and query encoder.
-swift build -c release --product DigUpApp
+swift build -c release --product RedigApp
 swift build -c release --product digup
 BIN_DIR="$(swift build -c release --show-bin-path)"
 
@@ -38,9 +38,9 @@ ICON="Resources/AppIcon.icns"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
-# The binary is DigUpApp in SwiftPM (it can't share a name with the `digup` CLI on a case-insensitive disk).
-cp "$BIN_DIR/DigUpApp" "$APP/Contents/MacOS/$APP_NAME"
-# The indexing helper lives in Helpers/: next to DigUp in MacOS/ it would collide on a case-insensitive disk.
+# Stage the RedigApp SwiftPM product under the bundle's executable name.
+cp "$BIN_DIR/RedigApp" "$APP/Contents/MacOS/$APP_NAME"
+# The indexing helper has its own location in the bundle.
 cp "$BIN_DIR/digup" "$APP/Contents/Helpers/digup"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 xcrun actool --compile "$APP/Contents/Resources" --platform macosx --target-device mac --minimum-deployment-target 14.0 \

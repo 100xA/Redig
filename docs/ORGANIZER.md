@@ -1,6 +1,6 @@
 # Local Mac organizer
 
-This fork extends Abdur Rahim's [DigUp](https://github.com/ARahim3/DigUp) with local project collections and reversible
+Redig extends Abdur Rahim's [DigUp](https://github.com/ARahim3/DigUp) with local project collections and reversible
 filing. It uses the existing Swift engine, EmbeddingGemma runtime and index; there is no separate AI server or account.
 The original project and dependency credits remain in the README, license and acknowledgements.
 
@@ -23,7 +23,7 @@ running for new grouping and filing work. Quitting stops it; collections and his
 
 Existing project folders provide initial project collections. Related loose files are compared with their pooled
 embeddings, including across Downloads, Desktop and Documents. Related loose files can also form new virtual
-collections. Their proposed filing destination is a project folder under `DigUp Organized` in a selected root.
+collections. Their proposed filing destination is a project folder under `Redig Organized` in a selected root.
 New collections remain virtual until you file a member yourself. Collection names are derived locally from folder
 and file names and can be edited.
 
@@ -39,9 +39,12 @@ Automatic filing requires all of the following:
 - Indexing is not paused or outside its scheduled hours, and the configured roots are available and readable.
 
 Filing runs in small batches on a utility queue. Files already inside project folders are not automatically
-reshuffled. Filename-only fallback matches and ambiguous matches require review. The organizer supports DigUp's
+reshuffled. Filename-only fallback matches and ambiguous matches require review. The organizer supports Redig's
 indexed documents, PDFs, pictures, screenshots, audio and video; unsupported archives/installers and excluded code
 projects are outside this version's scope. It does not create Finder tags or rewrite document contents.
+
+Existing `DigUp Organized` folders and filing destinations remain valid after renaming to Redig. The existing
+DigUp support directory and settings identifiers are retained to reuse models, indexes and undo history.
 
 Removing a folder from Organizer stops organizing it; it remains searchable until removed in **Settings → Folders**.
 Removing a search root or adding an exclusion also revokes future organizer operations in that scope. Turning off

@@ -41,7 +41,7 @@ enum StatusIcon {
             }
             return true
         }
-        image.accessibilityDescription = "DigUp"
+        image.accessibilityDescription = "Redig"
         return image
     }
 }
@@ -94,7 +94,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             shownPaused = paused
             shownUpdate = update
         }
-        button.toolTip = "DigUp — \(model.statusLine)"
+        button.toolTip = "Redig — \(model.statusLine)"
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -106,7 +106,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(header)
         menu.addItem(.separator())
         if let version = model.updateAvailable {
-            menu.addItem(ActionMenuItem("Update to DigUp \(version)…") { [weak self] in self?.onCheckForUpdates() })
+            menu.addItem(ActionMenuItem("Update to Redig \(version)…") { [weak self] in self?.onCheckForUpdates() })
             menu.addItem(.separator())
         }
 
@@ -119,7 +119,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             search.keyEquivalentModifierMask = modifiers
         }
         menu.addItem(search)
-        menu.addItem(ActionMenuItem("Open DigUp") { [weak self] in self?.onOpenWindow() })
+        menu.addItem(ActionMenuItem("Open Redig") { [weak self] in self?.onOpenWindow() })
         menu.addItem(ActionMenuItem("Organize Files…") { [weak self] in self?.onOrganizer() })
         if model.hasFolders {
             menu.addItem(.separator())
@@ -139,7 +139,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         if model.updateAvailable == nil {
             menu.addItem(ActionMenuItem("Check for Updates…") { [weak self] in self?.onCheckForUpdates() })
         }
-        menu.addItem(ActionMenuItem("Quit DigUp", key: "q") { NSApp.terminate(nil) })
+        menu.addItem(ActionMenuItem("Quit Redig", key: "q") { NSApp.terminate(nil) })
     }
 
     /// The menu as text, for the -debugMenu launch argument (menus can't be clicked from a script).

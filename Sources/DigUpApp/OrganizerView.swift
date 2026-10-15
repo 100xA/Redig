@@ -47,7 +47,7 @@ struct OrganizerView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Let your files find their projects")
                     .font(.system(size: 13, weight: .semibold))
-                Text("DigUp connects related files on this Mac. Project collections keep files where they are; "
+                Text("Redig connects related files on this Mac. Project collections keep files where they are; "
                      + "filing moves them into a project folder and keeps an undo history.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -58,7 +58,7 @@ struct OrganizerView: View {
                     .disabled(organizer.busy)
                 Button("Choose Folders…") { organizer.chooseFolders() }
                     .disabled(organizer.busy)
-                Text("Choose which folders DigUp may read. File contents and project matching stay local.")
+                Text("Choose which folders Redig may read. File contents and project matching stay local.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -72,7 +72,7 @@ struct OrganizerView: View {
             Toggle(isOn: Binding(get: { organizer.enabled }, set: { organizer.setEnabled($0) })) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Group files into projects")
-                    Text("Collections update as DigUp indexes new and changed files.")
+                    Text("Collections update as Redig indexes new and changed files.")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -147,7 +147,7 @@ struct OrganizerView: View {
             }
             if let problem = organizer.problem { problemText(problem) }
             if organizer.snapshot.projects.isEmpty && !organizer.busy {
-                Text("Projects appear when related files have been indexed. You can keep searching while DigUp works.")
+                Text("Projects appear when related files have been indexed. You can keep searching while Redig works.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

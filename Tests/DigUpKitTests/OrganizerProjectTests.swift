@@ -72,6 +72,7 @@ import Testing
             let project = try #require(before.projects.first)
             #expect(project.memberCount == 2)
             #expect(!project.isExistingFolder)
+            #expect(project.destinationPath.contains("/Redig Organized/"))
             #expect(before.assignments.allSatisfy { !$0.canMoveAutomatically })
             #expect(before.reviewItems.count == 1)
             try organizer.rename(projectID: project.id, name: "Mars Mission")
@@ -97,6 +98,43 @@ import Testing
             #expect(after.projects.first?.id == project.id)
             #expect(after.projects.first?.name == project.name)
             #expect(after.assignments.allSatisfy { $0.reason == .existingFolder && !$0.canMoveAutomatically })
+        }
+    }
+
+    @Test(arguments: ["DigUp Organized", "Redig Organized"])
+    func managedFoldersExposeTheirContainedProjects(folder: String) throws {
+        try withStores { index, organizer, root in
+            try add(index, root, "\(folder)/Atlas/research.md", values: vector(0))
+            try add(index, root, "\(folder)/Borealis/budget.md", values: vector(1))
+            let snapshot = try organizer.refresh(index: index, roots: [root])
+            #expect(snapshot.projects.map(\.name) == ["Atlas", "Borealis"])
+            let expectedRoot = FolderSelection.realPath(root.path) + "/" + folder
+            #expect(snapshot.projects.map(\.destinationPath) == [expectedRoot + "/Atlas", expectedRoot + "/Borealis"])
+            #expect(snapshot.assignments.allSatisfy { $0.reason == .existingFolder && !$0.canMoveAutomatically })
+        }
+    }
+
+    @Test(arguments: [true, false])
+    func rebrandingKeepsPreviouslyChosenDestinations(semantic: Bool) throws {
+        try withStores { index, organizer, root in
+            try add(index, root, "Mars mission budget.md", values: semantic ? vector(0) : nil)
+            try add(index, root, "Mars mission research.md", values: semantic ? vector(0) : nil)
+            let before = try organizer.refresh(index: index, roots: [root])
+            let project = try #require(before.projects.first)
+            #expect(project.destinationPath.contains("/Redig Organized/"))
+            let legacyDestination = project.destinationPath.replacingOccurrences(of: "/Redig Organized/", with: "/DigUp Organized/")
+            let cache = try Database(path: index.directory.appendingPathComponent("organizer.sqlite").path)
+            // Simulate a collection persisted by the previous product, then force a refresh with a new file.
+            for table in ["organizer_projects", "organizer_meta"] {
+                let column = table == "organizer_projects" ? "payload" : "value"
+                try cache.run("UPDATE \(table) SET \(column) = replace(\(column), ?, ?)",
+                              [.text("Redig Organized"), .text("DigUp Organized")])
+            }
+            try add(index, root, "Mars mission plan.md", values: semantic ? vector(0) : nil)
+            let after = try organizer.refresh(index: index, roots: [root])
+            let current = try #require(after.projects.first { $0.id == project.id })
+            #expect(current.destinationPath == legacyDestination)
+            #expect(current.memberCount == 3)
         }
     }
 

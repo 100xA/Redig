@@ -1,5 +1,5 @@
 {
-  "mainBinaryName": "DigUp",
+  "mainBinaryName": "Redig",
   "bundle": {
     "windows": {
       "nsis": {

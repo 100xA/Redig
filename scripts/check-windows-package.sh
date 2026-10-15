@@ -1,10 +1,10 @@
 #!/bin/bash
-# Checks DigUp's Windows installer the way someone first meets it: installed silently for the current user, a hidden
+# Checks Redig's Windows installer the way someone first meets it: installed silently for the current user, a hidden
 # first launch goes through setup by itself (the model from MODELS, downloaded there when it isn't), indexes a picture,
 # a screenshot, a recording and a note with the model and finds the note from the search panel; then its helper runs
 # with only Windows on PATH (everything else it needs is beside it). In Git for Windows' bash; the packages workflow
 # runs it after building the installer.
-#   MODELS=<folder> scripts/check-windows-package.sh <DigUp_x.y.z_x64-setup.exe>
+#   MODELS=<folder> scripts/check-windows-package.sh <Redig_x.y.z_x64-setup.exe>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 setup=${1:?the installer}
@@ -17,8 +17,8 @@ win() { cygpath -m "$1"; }
 
 echo "installing $setup"
 MSYS_NO_PATHCONV=1 "$setup" /S
-installed=$(cygpath -u "$LOCALAPPDATA")/DigUp
-ls "$installed/DigUp.exe" "$installed/helper/digup.exe" > /dev/null
+installed=$(cygpath -u "$LOCALAPPDATA")/Redig
+ls "$installed/Redig.exe" "$installed/helper/digup.exe" > /dev/null
 # The licenses of what the installer carries, beside the app.
 grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$installed/THIRD-PARTY-NOTICES.txt" || { echo "no license notices"; exit 1; }
 
@@ -34,7 +34,7 @@ TEXT
 
 echo "first launch"
 started=$(date +%s)
-"$installed/DigUp.exe" --index "$(win "$work/index")" --models "$models" --settings "$(win "$work/settings.json")" \
+"$installed/Redig.exe" --index "$(win "$work/index")" --models "$models" --settings "$(win "$work/settings.json")" \
   --offer "$(win "$work/files")" --hotkey "Ctrl+Alt+Shift+D" --debug-setup --debug-query "how long to bake the cake" \
   --debug-quit > "$work/out.txt" 2> "$work/err.txt" &
 app=$!
@@ -44,12 +44,12 @@ while kill -0 "$app" 2> /dev/null && (( $(date +%s) - started < 1800 )); do
   [[ -n $report ]] && break
   sleep 2
 done
-# The report comes just before DigUp quits; a DigUp still there a minute later is ended (a session without a desktop,
+# The report comes just before Redig quits; a Redig still there a minute later is ended (a session without a desktop,
 # as a service has, keeps it from quitting).
 for _ in $(seq 30); do kill -0 "$app" 2> /dev/null || break; sleep 2; done
 if kill -0 "$app" 2> /dev/null; then
-  echo "DigUp didn't quit after its report: ending it"
-  taskkill //F //T //IM DigUp.exe > /dev/null || true
+  echo "Redig didn't quit after its report: ending it"
+  taskkill //F //T //IM Redig.exe > /dev/null || true
 fi
 report=$(grep '^{' "$work/out.txt" | tail -1 || true)
 echo "after $(( $(date +%s) - started )) s"

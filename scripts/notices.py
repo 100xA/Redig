@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the third-party notices DigUp's Windows and Linux packages carry: the license of every library they ship, from
+"""Writes the third-party notices Redig's Windows and Linux packages carry: the license of every library they ship, from
 the libraries' own license files (llama.cpp's and PDFium's from Vendor/, ffmpeg's, dav1d's and zlib's from the small
 ffmpeg scripts/build-ffmpeg.sh makes, Swift's from the toolchain or scripts/licenses), and of every Rust crate the app
 is built from (Cargo's own record of them, normal dependencies only: build tools and macros don't end up in the app).
@@ -110,7 +110,7 @@ def rust_section(platform):
             text = read(path)
             by_text.setdefault(" ".join(text.split()), (text, []))[1].append(label)
     parts = [RULE, f"Rust crates in the app ({len(crates)}), each under its own license", RULE, "",
-             "The app around DigUp's search on Windows and Linux is written in Rust with Tauri (https://tauri.app). "
+             "The app around Redig's search on Windows and Linux is written in Rust with Tauri (https://tauri.app). "
              "These are the crates it is built from, with the license files they ship; a text several crates share "
              "is printed once, after their names.", ""]
     for text, labels in sorted(by_text.values(), key=lambda item: item[1][0]):
@@ -137,10 +137,10 @@ def main():
     windows = platform == "windows"
 
     parts = [
-        "DigUp for Windows and Linux includes code from these projects, under their own licenses. Thank you.",
+        "Redig for Windows and Linux includes code from these projects, under their own licenses. Thank you.",
         "",
-        "DigUp (https://github.com/ARahim3/DigUp) is MIT licensed; its license is the first one below. The model it uses, "
-        "Google DeepMind's EmbeddingGemma 2 (Apache 2.0), isn't part of this download: DigUp downloads it from Hugging "
+        "Redig is based on DigUp (https://github.com/ARahim3/DigUp), created by Abdur Rahim under the MIT license below. The model it uses, "
+        "Google DeepMind's EmbeddingGemma 2 (Apache 2.0), isn't part of this download: Redig downloads it from Hugging "
         "Face on first launch.",
         "",
         section("DigUp", need(ROOT / "LICENSE")),
@@ -162,7 +162,7 @@ def main():
                 "no GPL or nonfree parts. Its source is FFmpeg's release tarball, "
                 f"https://ffmpeg.org/releases/ffmpeg-{ffmpeg}.tar.xz, unmodified, configured and built by "
                 "scripts/build-ffmpeg.sh in DigUp's repository (https://github.com/ARahim3/DigUp), which also builds "
-                "dav1d and links zlib. ffmpeg and ffprobe run as programs of their own: you can replace them in DigUp's "
+                "dav1d and links zlib. ffmpeg and ffprobe run as programs of their own: you can replace them in Redig's "
                 "helper folder with your own build.",
                 f"What this build says about itself:\n\n{need(ffmpeg_licenses / 'ffmpeg-version.txt')}",
                 need(ffmpeg_licenses / "ffmpeg-LICENSE.md"),
@@ -176,14 +176,14 @@ def main():
                 "and forgive others. May you share freely, never taking more than you give.\""),
         section("stb (https://github.com/nothings/stb), reads and writes pictures", stb_license()),
         section("miniz (https://github.com/richgel999/miniz), reads docx and odt files", miniz_license()),
-        section("Swift's runtime, Foundation and libdispatch (https://swift.org), which DigUp's helper is written with",
+        section("Swift's runtime, Foundation and libdispatch (https://swift.org), which Redig's helper is written with",
                 swift_license()),
         section("ICU (https://icu.unicode.org), in Swift's Foundation and in PDFium (the same license, printed with "
                 "PDFium's above)", need(pdfium / "licenses/icu.txt")),
     ]
     if windows:
         parts += [section("Microsoft Visual C++ runtime and WebView2",
-                          "DigUp's helper ships Microsoft's Visual C++ runtime libraries, which their license allows "
+                          "Redig's helper ships Microsoft's Visual C++ runtime libraries, which their license allows "
                           "redistributing, and the app's window uses the Microsoft Edge WebView2 runtime that Windows "
                           "provides (its loader is linked into the app under the WebView2 SDK's license).")]
     else:

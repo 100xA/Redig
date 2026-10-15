@@ -1,10 +1,10 @@
 #!/bin/bash
-# Launches build.noindex/DigUp.app against the testbed with a scratch index, models folder and settings under
+# Launches build.noindex/Redig.app against the testbed with a scratch index, models folder and settings under
 # .dev/ and a separate defaults suite: never real folders, never the real index, model or settings. Extra launch
 # arguments pass through, e.g.
 #   scripts/dev-run.sh -debugQuery "zebra" -debugSnapshot /tmp/panel.png -debugQuit YES
 # ROOTS=a:b:c overrides the folders (keep them inside the testbed); ROOTS= (empty) launches with none, as a fresh
-# install would. INDEX, MODELS and SUITE override the rest; APP=/Applications/DigUp.app runs an installed copy the
+# install would. INDEX, MODELS and SUITE override the rest; APP=/Applications/Redig.app runs an installed copy the
 # same way. The app's log is <index>/app.log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -22,10 +22,10 @@ if [[ "$MODELS" == "$PWD/.dev/models" ]]; then
   done
 fi
 
-# Only an earlier run of this same copy is stopped: an installed DigUp in use keeps running.
-APP="${APP:-build.noindex/DigUp.app}"
-EXE="$(cd "$APP" && pwd -P)/Contents/MacOS/DigUp"
-for pid in $(pgrep -x DigUp); do
+# Only an earlier run of this same copy is stopped: an installed Redig in use keeps running.
+APP="${APP:-build.noindex/Redig.app}"
+EXE="$(cd "$APP" && pwd -P)/Contents/MacOS/Redig"
+for pid in $(pgrep -x Redig); do
   [[ "$(ps -o comm= -p "$pid")" == "$EXE" ]] && kill "$pid" && sleep 0.5
 done
 ARGS=(-indexDir "$INDEX" -modelsDir "$MODELS" -defaultsSuite "$SUITE")

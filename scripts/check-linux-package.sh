@@ -1,14 +1,14 @@
 #!/bin/bash
-# Checks an installed DigUp for Linux the way someone first meets it, without a desktop: the shell and its helper find
+# Checks an installed Redig for Linux the way someone first meets it, without a desktop: the shell and its helper find
 # every library they need, and a hidden first launch under a virtual screen (Xvfb) with a session bus goes through setup
 # by itself (the model from MODELS, downloaded there when it isn't), indexes a picture, a screenshot, a recording and a
 # note with the model, and finds the note from the search panel. The packages workflow runs it on each distribution
 # after installing the .deb, and on the AppImage.
-#   MODELS=<folder> scripts/check-linux-package.sh [/usr/bin/digup-shell | <DigUp.AppImage>]
+#   MODELS=<folder> scripts/check-linux-package.sh [/usr/bin/Redig | <Redig.AppImage>]
 # Needs xvfb-run (xvfb, xauth) and dbus-run-session (dbus).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-app=$(realpath "${1:-/usr/bin/digup-shell}")
+app=$(realpath "${1:-/usr/bin/Redig}")
 models=${MODELS:?set MODELS to a folder for the model files (they are downloaded there when missing)}
 mkdir -p "$models"
 work=$(mktemp -d)
@@ -19,7 +19,7 @@ if [[ $app == *.AppImage ]]; then
   export APPIMAGE_EXTRACT_AND_RUN=1
   helper=
 else
-  helper=$(dirname "$app")/../lib/DigUp/helper/digup
+  helper=$(dirname "$app")/../lib/Redig/helper/digup
   missing=$(for file in "$app" "$(dirname "$helper")"/*; do
     # ffmpeg and ffprobe are static: ldd has nothing to say about them. The Vulkan backend is loaded only where
     # Vulkan is (the package recommends it).
@@ -31,7 +31,7 @@ else
     exit 1
   fi
   # The licenses of what the package carries: beside the app, and where Debian keeps a package's.
-  for notices in "$(dirname "$app")/../lib/DigUp/THIRD-PARTY-NOTICES.txt" "$(dirname "$app")/../share/doc/dig-up/copyright"; do
+  for notices in "$(dirname "$app")/../lib/Redig/THIRD-PARTY-NOTICES.txt" "$(dirname "$app")/../share/doc/redig/copyright"; do
     grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$notices" || { echo "no license notices in $notices"; exit 1; }
   done
 fi

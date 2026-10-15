@@ -610,7 +610,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // The launch at login says so: DigUp then waits in the tray instead of showing its window.
-        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--at-login"])))
+        // Keep the existing startup entry key so a rename retains the person's login setting.
+        .plugin(tauri_plugin_autostart::Builder::new().app_name("DigUp").arg("--at-login").build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
@@ -630,7 +631,7 @@ fn main() {
             set_tray_click, check_for_updates, offer_update, set_update_checks, open_licenses
         ])
         .build(tauri::generate_context!())
-        .expect("DigUp couldn't start");
+        .expect("Redig couldn't start");
     app.run(|app, event| match event {
         tauri::RunEvent::Exit => {
             stop_helpers(app);
@@ -946,7 +947,7 @@ fn quit(app: &AppHandle) {
 fn make_panel(app: &AppHandle, centered: bool) -> tauri::Result<()> {
     let (label, page) = if centered { (CENTERED_PANEL, "index.html?fills") } else { (PANEL, "index.html") };
     let panel = WebviewWindowBuilder::new(app, label, WebviewUrl::App(page.into()))
-        .title("DigUp")
+        .title("Redig")
         .inner_size(PANEL_WIDTH, FIELD_HEIGHT)
         .decorations(false)
         .transparent(true)
@@ -1053,7 +1054,7 @@ fn show_window(app: &AppHandle) -> tauri::Result<()> {
     // Debug runs look at it hidden: a window on screen takes the keyboard.
     let hidden = shell.options.debug_window.is_some() && !shell.options.debug_show;
     let mut builder = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("window.html".into()))
-        .title("DigUp")
+        .title("Redig")
         .min_inner_size(820.0, 520.0)
         .visible(false);
     // Where it was left, at the size it had, while that's still on a screen; else sized to this screen, centered.
@@ -1153,7 +1154,7 @@ fn show_setup(app: &AppHandle) -> tauri::Result<()> {
     }
     let hidden = app.state::<Arc<Shell>>().options.debug_setup;
     WebviewWindowBuilder::new(app, "setup", WebviewUrl::App("setup.html".into()))
-        .title("Set Up DigUp")
+        .title("Set Up Redig")
         .inner_size(720.0, 600.0)
         .resizable(false)
         .maximizable(false)
@@ -1172,7 +1173,7 @@ fn show_settings(app: &AppHandle) -> tauri::Result<()> {
     }
     let options = &app.state::<Arc<Shell>>().options;
     WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("settings.html".into()))
-        .title("DigUp Settings")
+        .title("Redig Settings")
         .inner_size(660.0, 620.0)
         .resizable(false)
         .maximizable(false)
@@ -1411,7 +1412,7 @@ async fn check_for_updates(app: AppHandle) {
     updates::check(&app, true).await;
 }
 
-/// "Update to DigUp X…" (the tray, the window's status bar and ⋯): what's new, then Install and Restart.
+/// "Update to Redig X…" (the tray, the window's status bar and ⋯): what's new, then Install and Restart.
 #[tauri::command]
 fn offer_update(app: AppHandle) {
     updates::offer(&app);
@@ -1531,13 +1532,13 @@ fn make_tray(app: &AppHandle, shell: &Arc<Shell>) -> tauri::Result<()> {
     // The shortcut beside Search… only where DigUp grabs it: elsewhere the desktop has it, maybe changed there.
     let accelerator = (shell.shortcut == Method::Grab).then(|| shell.hotkey());
     let search = MenuItem::with_id(app, "search", "Search…", true, accelerator.as_deref())?;
-    let open = MenuItem::with_id(app, "open", "Open DigUp", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open Redig", true, None::<&str>)?;
     let folders = MenuItem::with_id(app, "folders", "Choose Folders…", true, None::<&str>)?;
     let index = MenuItem::with_id(app, "index", "Index Now", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause Indexing", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
     let check = MenuItem::with_id(app, "check", "Check for Updates…", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit DigUp", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Redig", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
         app,
@@ -1549,7 +1550,7 @@ fn make_tray(app: &AppHandle, shell: &Arc<Shell>) -> tauri::Result<()> {
     *shell.tray_look.lock().unwrap() = Some(look);
     TrayIconBuilder::with_id("digup")
         .icon(tray_icon::image(look))
-        .tooltip("DigUp")
+        .tooltip("Redig")
         .menu(&menu)
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {

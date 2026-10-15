@@ -121,7 +121,7 @@ pub mod gnome {
         if new {
             set("binding", &to_gnome(accelerator)?)?;
         }
-        set("name", "DigUp")?;
+        set("name", "Redig")?;
         set("command", command)?;
         if new {
             // Listed last, so GNOME never reads half an entry.
@@ -208,7 +208,7 @@ pub mod kde {
 
     const SERVICE: &str = "org.kde.kglobalaccel";
     /// The component, the action, and their names as System Settings shows them (sent as a slice: `as` on D-Bus).
-    const ACTION: [&str; 4] = ["com.abdurrahim.DigUp", "toggle-panel", "DigUp", "Show or Hide the Search Panel"];
+    const ACTION: [&str; 4] = ["com.abdurrahim.DigUp", "toggle-panel", "Redig", "Show or Hide the Search Panel"];
     // KGlobalAccel's flags (kglobalacceld.h), and Qt's modifiers in a key code.
     const SET_PRESENT: u32 = 2;
     const IS_DEFAULT: u32 = 8;

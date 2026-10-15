@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds DigUp's Windows installer: the Tauri shell (shell/) with DigUp's helper, llama.cpp, PDFium, the Swift and C++
+# Builds Redig's Windows installer: the Tauri shell (shell/) with Redig's helper, llama.cpp, PDFium, the Swift and C++
 # runtimes and ffmpeg in its helper folder, as an NSIS installer that installs for the current user (no admin prompt).
 # Run it in Git for Windows' bash inside a Visual Studio developer environment, after scripts/fetch-vendor.sh,
 # scripts/build-llama.sh and scripts/build-ffmpeg.sh (that one in MSYS2's MINGW64 shell). Needs Swift, Rust, Python and
@@ -12,7 +12,7 @@ TAURI_CLI=2.12.2
 
 swift build -c release --product digup
 
-# What the installer puts beside DigUp.exe, in helper\ ("DigUp.exe" and "digup.exe" can't share a folder): the helper
+# What the installer puts beside Redig.exe, in helper\ ("Redig.exe" and "digup.exe" can't share a folder): the helper
 # finds the DLLs, llama.cpp's backends and ffmpeg in its own folder. The C++ runtime goes with them, so nothing needs
 # installing first; the shell itself links its C runtime statically (.cargo/config.toml).
 swift_root=$(cd "$(dirname "$(command -v swift)")/../../../.." && pwd)   # …/Swift from …/Swift/Toolchains/*/usr/bin

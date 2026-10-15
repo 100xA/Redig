@@ -73,5 +73,5 @@ pub fn copy_file(window: &tauri::WebviewWindow, path: &Path) -> Result<(), Strin
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn copy_file(_: &tauri::WebviewWindow, _: &Path) -> Result<(), String> {
-    Err("the shell copies files on Windows and Linux (on a Mac, the DigUp app does)".into())
+    Err("the shell copies files on Windows and Linux (on a Mac, the Redig app does)".into())
 }

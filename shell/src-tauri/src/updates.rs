@@ -1,7 +1,7 @@
 //! In-app updates on Windows and Linux (the Mac app has Sparkle: Sources/DigUpApp/Updates.swift). Once a day, unless the
 //! person turned it off (Settings → General), DigUp reads its update feed (`plugins.updater.endpoints` in
 //! tauri.conf.json: updates/latest.json in DigUp's repository, which a release adds last). An update it finds waits
-//! quietly, as on the Mac: "Update to DigUp X…" in the tray menu, a dot on the tray icon, a line in the window's status
+//! quietly, as on the Mac: "Update to Redig X…" in the tray menu, a dot on the tray icon, a line in the window's status
 //! bar. Choosing it shows what's new; then DigUp downloads it, checks its signature against the public key in
 //! tauri.conf.json, installs it and starts again. The Windows installer and the AppImage update themselves; a .deb needs
 //! admin rights to be replaced, so there the update's release page opens instead.
@@ -57,11 +57,11 @@ impl Updates {
         let version = &found.as_ref()?.version;
         Some(match *self.phase.lock().unwrap() {
             Phase::Downloading => match *self.percent.lock().unwrap() {
-                Some(percent) => (format!("Downloading DigUp {version}… {percent}%"), false),
-                None => (format!("Downloading DigUp {version}…"), false),
+                Some(percent) => (format!("Downloading Redig {version}… {percent}%"), false),
+                None => (format!("Downloading Redig {version}…"), false),
             },
-            Phase::Installing => (format!("Installing DigUp {version}…"), false),
-            _ => (format!("Update to DigUp {version}…"), true),
+            Phase::Installing => (format!("Installing Redig {version}…"), false),
+            _ => (format!("Update to Redig {version}…"), true),
         })
     }
 }
@@ -112,7 +112,7 @@ pub fn start(app: &AppHandle) {
         return;
     }
     let shell = app.state::<Arc<Shell>>().inner().clone();
-    log(&shell, &format!("DigUp {} started", app.package_info().version));
+    log(&shell, &format!("Redig {} started", app.package_info().version));
     let debug = shell.options.debug_update_check;
     if !debug && (cfg!(debug_assertions) || shell.dev_run()) {
         return;
@@ -141,8 +141,8 @@ pub fn start(app: &AppHandle) {
 pub async fn check(app: &AppHandle, asked: bool) {
     if option_env!("DIGUP_ENABLE_SIGNED_UPDATES") != Some("1") {
         if asked {
-            app.dialog().message("Updates are disabled for this source fork. Build the latest version from github.com/100xA/DigUp.")
-                .title("DigUp updates").kind(MessageDialogKind::Info).show(|_| {});
+            app.dialog().message("Updates are disabled for this source fork. Build the latest version from github.com/100xA/Redig.")
+                .title("Redig updates").kind(MessageDialogKind::Info).show(|_| {});
         }
         return;
     }
@@ -195,19 +195,19 @@ pub async fn check(app: &AppHandle, asked: bool) {
             *shell.updates.found.lock().unwrap() = None;
             changed(app);
             if asked {
-                tell(app, "You're up to date", &format!("DigUp {} is the newest version.", app.package_info().version));
+                tell(app, "You're up to date", &format!("Redig {} is the newest version.", app.package_info().version));
             }
         }
         Err(error) => {
             log(&shell, &format!("couldn't check: {error}"));
             if asked {
-                tell(app, "Check for Updates", &format!("DigUp couldn't check for updates: {error}"));
+                tell(app, "Check for Updates", &format!("Redig couldn't check for updates: {error}"));
             }
         }
     }
 }
 
-/// "Update to DigUp X…": what's new, then Install and Restart (or, for a .deb, the release page to download it from).
+/// "Update to Redig X…": what's new, then Install and Restart (or, for a .deb, the release page to download it from).
 pub fn offer(app: &AppHandle) {
     let shell = app.state::<Arc<Shell>>().inner().clone();
     let Some(update) = shell.updates.found.lock().unwrap().clone() else { return };
@@ -215,7 +215,7 @@ pub fn offer(app: &AppHandle) {
         return;   // already on its way
     }
     let installs = installs_itself();
-    let mut text = format!("DigUp {} is available. You have {}.", update.version, app.package_info().version);
+    let mut text = format!("Redig {} is available. You have {}.", update.version, app.package_info().version);
     if let Some(notes) = update.body.as_deref().map(str::trim).filter(|notes| !notes.is_empty()) {
         text.push_str("\n\n");
         text.push_str(notes);
@@ -228,7 +228,7 @@ pub fn offer(app: &AppHandle) {
     app.clone()
         .dialog()
         .message(text)
-        .title("DigUp Update")
+        .title("Redig Update")
         .kind(MessageDialogKind::Info)
         .buttons(MessageDialogButtons::OkCancelCustom(yes.into(), no.into()))
         .show(move |yes| {
@@ -305,7 +305,7 @@ fn failed(app: &AppHandle, problem: &str) {
     *shell.updates.percent.lock().unwrap() = None;
     changed(app);
     if !shell.options.debug_update_install {
-        tell(app, "DigUp Update", &format!("The update didn't go through: {problem}"));
+        tell(app, "Redig Update", &format!("The update didn't go through: {problem}"));
     }
 }
 
@@ -332,6 +332,6 @@ mod tests {
     fn release_pages() {
         assert_eq!(release_page("https://github.com/ARahim3/DigUp/releases/download/v0.7.0-beta.1/DigUp_0.7.0-beta.1_amd64.AppImage"),
                    "https://github.com/ARahim3/DigUp/releases/tag/v0.7.0-beta.1");
-        assert_eq!(release_page("http://127.0.0.1:8765/DigUp.AppImage"), "https://github.com/ARahim3/DigUp/releases");
+        assert_eq!(release_page("http://127.0.0.1:8765/Redig.AppImage"), "https://github.com/ARahim3/DigUp/releases");
     }
 }

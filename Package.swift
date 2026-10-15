@@ -1,7 +1,7 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-// DigUp builds on macOS (the app, the CLI and its helpers) and, since the port, the engine and the CLI on
+// Redig builds on macOS (the app, the CLI and its helpers) and, since the port, the engine and the CLI on
 // Linux and Windows too. The manifest picks each platform's pieces: how llama.cpp is linked, the C libraries the engine
 // needs where Apple's frameworks aren't there (SQLite, stb, miniz, PDFium: scripts/fetch-vendor.sh puts them in
 // Vendor/), and the app, which is macOS only.
@@ -50,14 +50,14 @@ let portableTargets: [Target] = [
 #endif
 
 #if os(macOS)
-let appProducts: [Product] = [.executable(name: "DigUpApp", targets: ["DigUpApp"])]
+let appProducts: [Product] = [.executable(name: "RedigApp", targets: ["DigUpApp"])]
 let appDependencies: [Package.Dependency] = [
     // In-app updates (the app only). build.sh embeds the framework in Contents/Frameworks and signs it.
     .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
 ]
 let appTargets: [Target] = [
-    // The menubar + hotkey app. build.sh wraps it into build.noindex/DigUp.app. (The product can't be called
-    // "DigUp": on a case-insensitive disk it would collide with the `digup` CLI binary.)
+    // The menubar + hotkey app. build.sh wraps RedigApp into build.noindex/Redig.app.
+    // Keep the source target and engine module names stable for existing development tools.
     .executableTarget(
         name: "DigUpApp",
         dependencies: ["DigUpKit", .product(name: "Sparkle", package: "Sparkle")],
@@ -72,7 +72,7 @@ let appTargets: [Target] = []
 #endif
 
 let package = Package(
-    name: "DigUp",
+    name: "Redig",
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "digup", targets: ["digup"]),

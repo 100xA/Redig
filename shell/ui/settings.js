@@ -1,4 +1,4 @@
-// DigUp's Settings window, its tabs after the Mac app's (Sources/DigUpApp/SettingsWindow.swift). General: opening at
+// Redig's Settings window, its tabs after the Mac app's (Sources/DigUpApp/SettingsWindow.swift). General: opening at
 // login, centering the search panel where the desktop places windows itself (it costs memory, so it's a choice), where
 // the shortcut lives, and updates. Folders: how indexing goes (with Pause), each folder searched and how far along it is, the
 // folders and file types skipped, and the set hours. Code: code search's folders (added in setup's folder list for code),
@@ -12,9 +12,9 @@ const isWindows = /Win/.test(navigator.platform);
 const $ = (id) => document.getElementById(id);
 
 const notes = {
-  gnome: "DigUp added it to GNOME's keyboard shortcuts. To change it: Settings → Keyboard → View and Customize " +
+  gnome: "Redig added it to GNOME's keyboard shortcuts. To change it: Settings → Keyboard → View and Customize " +
     "Shortcuts → Custom Shortcuts.",
-  kde: "DigUp added it to KDE's shortcuts. To change it: System Settings → Shortcuts → DigUp.",
+  kde: "Redig added it to KDE's shortcuts. To change it: System Settings → Shortcuts → Redig.",
   by_hand: "This desktop doesn't let apps set their own shortcuts. To open the panel with one, add a shortcut in its " +
     "keyboard settings that runs:",
 };
@@ -61,15 +61,15 @@ function renderGeneral() {
 /// Updates: the daily check, and this version or the one waiting (updates.rs).
 function renderUpdates() {
   $("update-checks").checked = info.updateChecks;
-  $("update-info").textContent = "Once a day DigUp asks GitHub for its newest version; nothing about your files is sent. "
+  $("update-info").textContent = "Once a day Redig asks GitHub for its newest version; nothing about your files is sent. "
     + (info.installsUpdates ? "Updates install with one click."
       : "A new version is downloaded from its release page and installed as this one was.");
   const update = info.state && info.state.update;
   const version = $("update-version");
   version.classList.toggle("available", Boolean(update));
-  version.textContent = !update ? `DigUp ${info.version}`
-    : update.state === "downloading" ? `Downloading DigUp ${update.version}…` + (update.percent != null ? ` ${update.percent}%` : "")
-    : update.state === "installing" ? `Installing DigUp ${update.version}…` : `DigUp ${update.version} is available`;
+  version.textContent = !update ? `Redig ${info.version}`
+    : update.state === "downloading" ? `Downloading Redig ${update.version}…` + (update.percent != null ? ` ${update.percent}%` : "")
+    : update.state === "installing" ? `Installing Redig ${update.version}…` : `Redig ${update.version} is available`;
 }
 
 $("licenses").onclick = () => invoke("open_licenses").catch(fail);
@@ -111,7 +111,7 @@ for (const choice of document.querySelectorAll('input[name="tray-click"]')) {
   });
 }
 
-// MARK: The shortcut (where DigUp grabs it itself: Windows, X11; shortcut.js)
+// MARK: The shortcut (where Redig grabs it itself: Windows, X11; shortcut.js)
 
 let recording = false;
 
@@ -157,7 +157,7 @@ async function loadSummaries() {
 function renderFolders() {
   const rows = $("folder-rows");
   rows.replaceChildren();
-  if (!info.folders?.length) rows.append(element("div", "empty", "No folders yet. Add the ones DigUp should search."));
+  if (!info.folders?.length) rows.append(element("div", "empty", "No folders yet. Add the ones Redig should search."));
   for (const folder of info.folders || []) {
     const summary = (summaries || []).find((item) => samePath(item.path, folder)) || null;
     rows.append(folderRow(folder, summary));
@@ -393,7 +393,7 @@ function renderStorage() {
   pathButton($("model-path"), storage.models);
   $("index-size").textContent = bytes(storage.indexBytes || 0) + (storage.codeBytes ? ` (code ${bytes(storage.codeBytes)})` : "");
   pathButton($("index-path"), storage.index);
-  $("version").textContent = `DigUp ${info.version || ""} · EmbeddingGemma 2 by Google (Apache 2.0), run by llama.cpp (MIT).`;
+  $("version").textContent = `Redig ${info.version || ""} · EmbeddingGemma 2 by Google (Apache 2.0), run by llama.cpp (MIT).`;
   $("licenses").hidden = !info.licenses;
 }
 

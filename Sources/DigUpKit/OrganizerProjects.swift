@@ -52,7 +52,9 @@ public struct OrganizerProjectSnapshot: Codable, Sendable, Equatable {
 /// Uses only committed index metadata/vectors. Use this store and its IndexStore from the same serial queue.
 /// Its tables share organizer.sqlite with the move journal, without changing that database's user_version.
 public final class OrganizerProjectStore {
-    public static let managedFolderName = "DigUp Organized"
+    public static let managedFolderName = "Redig Organized"
+    // Existing installations retain their filing paths and move history after the product rename.
+    private static let managedFolderNames: Set<String> = [managedFolderName, "DigUp Organized"]
     private let db: Database
     /// Diagnostics for the bounded incremental refresh; not part of the UI contract.
     private(set) var representativeReads = 0
@@ -61,7 +63,7 @@ public final class OrganizerProjectStore {
     private static let matchThreshold = 0.86
     private static let moveThreshold = 0.90
     private static let ambiguityMargin = 0.08
-    private static let cacheVersion = "projects-v2"
+    private static let cacheVersion = "projects-v3"
     private static let maximumClusterCandidates = 256
 
     public init(directory: URL) throws {
@@ -277,7 +279,7 @@ public final class OrganizerProjectStore {
             let item = files[n]
             let components = item.path.dropFirst(item.root.count).split(separator: "/").map(String.init)
             guard components.count > 1 else { continue }
-            let depth = components[0] == Self.managedFolderName && components.count > 2 ? 2 : 1
+            let depth = Self.managedFolderNames.contains(components[0]) && components.count > 2 ? 2 : 1
             let folder = item.root + "/" + components.prefix(depth).joined(separator: "/")
             let prior = oldByDestination[folder]
             let id = prior?.id ?? "folder-" + Self.stableID(folder)
@@ -437,7 +439,8 @@ public final class OrganizerProjectStore {
             let id = "metadata-" + Self.stableID(key), root = files[members[0]].root
             let name = oldProjects[id]?.isUserNamed == true ? oldProjects[id]!.name : Self.projectName(members.map { files[$0].tokens })
             let project = OrganizerProject(id: id, name: name, memberCount: members.count, rootPath: root,
-                                           destinationPath: root + "/" + Self.managedFolderName + "/" + Self.safeFolder(name) + "-" + String(id.suffix(6)),
+                                           destinationPath: oldProjects[id]?.destinationPath ??
+                                               root + "/" + Self.managedFolderName + "/" + Self.safeFolder(name) + "-" + String(id.suffix(6)),
                                            isExistingFolder: false, isUserNamed: oldProjects[id]?.isUserNamed ?? false)
             groups[id] = Group(project: project, members: [], center: nil, terms: Self.terms(name))
             for n in members { add(n, to: id, reason: .filename, score: 1) }

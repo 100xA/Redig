@@ -5,7 +5,7 @@ work inside those boundaries rather than replacing the application architecture.
 
 Original project: [ARahim3/DigUp](https://github.com/ARahim3/DigUp), created by **Abdur Rahim**. The original MIT
 copyright, license and third party notices remain intact. Fork changes and the replacement icon are maintained in
-[100xA/DigUp](https://github.com/100xA/DigUp), starting from upstream commit
+[100xA/Redig](https://github.com/100xA/Redig), starting from upstream commit
 `ec28973268b81f836be72187ff23b3a16ef4fd97`. Implementation and verification were assisted by OpenAI Codex.
 
 ## Search

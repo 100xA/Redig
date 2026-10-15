@@ -6,7 +6,7 @@ import Foundation
 /// Saved in the app's defaults domain (com.abdurrahim.DigUp). Launch arguments override any of it without being
 /// saved, which is how tests point the app at the testbed and never at real folders:
 ///
-///     DigUp.app/Contents/MacOS/DigUp -roots ~/DigUpTestbed/real -indexDir <repo>/.dev/app-index \
+///     Redig.app/Contents/MacOS/Redig -roots ~/DigUpTestbed/real -indexDir <repo>/.dev/app-index \
 ///         -modelsDir <repo>/.dev/models -defaultsSuite com.abdurrahim.DigUp.dev
 ///
 /// `-roots` takes one folder, several joined with ":", or a plist array. `-defaultsSuite` keeps what the app saves

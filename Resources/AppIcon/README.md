@@ -1,7 +1,7 @@
-# DigUp fork icon
+# Redig icon
 
 A D shaped lens and a mint search handle, on a deep forest background. The reduced shape stays recognizable in a
-small search window or tray. This replacement icon was created for the independent [100xA fork](https://github.com/100xA/DigUp).
+small search window or tray. This replacement icon was created for the independent [100xA fork](https://github.com/100xA/Redig).
 The original DigUp app and its previous icon were created by [Abdur Rahim](https://github.com/ARahim3/DigUp).
 
 - `AppIcon.icon` is the editable Apple Icon Composer document, with separate Discovery and Search layers. It was
