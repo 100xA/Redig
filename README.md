@@ -190,6 +190,9 @@ swift build -c release && swift test
 ./build.sh                        # → build.noindex/DigUp.app
 ```
 
+If a synced workspace restores Finder metadata during signing, use
+`BUILD_DIR=/private/tmp/digup-build ./build.sh`. The app will be built at `/private/tmp/digup-build/DigUp.app`.
+
 On Windows and Linux you'll need Swift 6.4, Rust and Node; on Windows also Visual Studio's C++ build tools, with the
 commands run in Git for Windows' bash. `scripts/fetch-vendor.sh` and `scripts/build-llama.sh` get the libraries, then
 `scripts/package-linux.sh` makes the .deb and the AppImage, and `scripts/package-windows.sh` the installer.

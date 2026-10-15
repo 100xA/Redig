@@ -6,6 +6,8 @@
 #   SIGN_ID="<identity>" ./build.sh  this identity instead
 #   RELEASE=1 SIGN_ID="Developer ID Application: …" ./build.sh   plus the secure timestamp notarization needs
 #                                    (scripts/release.sh does that, then notarizes and makes the DMG)
+#   BUILD_DIR=/private/tmp/digup-build ./build.sh   stage outside a synced folder if its file provider restores
+#                                    FinderInfo metadata while codesign is running
 # There's no install step: run it from build.noindex (see scripts/dev-run.sh).
 # For testing in-app updates with a copy of its own (never the installed DigUp's settings or updates), these replace
 # Info.plist values: BUNDLE_ID, VERSION, BUILD_NUMBER, SPARKLE_FEED (the appcast URL), SPARKLE_KEY (the EdDSA public key).
@@ -14,7 +16,8 @@ cd "$(dirname "$0")"
 
 APP_NAME="DigUp"
 # ".noindex" keeps Spotlight (and the Apps list) from showing this staging copy.
-APP="build.noindex/$APP_NAME.app"
+BUILD_DIR="${BUILD_DIR:-build.noindex}"
+APP="$BUILD_DIR/$APP_NAME.app"
 
 # Use full Xcode's toolchain when it's installed, even if xcode-select points at the Command Line Tools.
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
