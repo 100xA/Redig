@@ -76,17 +76,17 @@ function run() {
     render();
     return;
   }
-  ask({ op: "embed_ahead", q: text, code }).catch(() => {});
+  ask({ generation, op: "embed_ahead", q: text, code }).catch(() => {});
   // Results of an earlier query stay until these are in; with none to show, a spinner.
   renderBar();
   if (!state.hasResults) renderContent();
   const filter = FILTERS.find((item) => item.key === state.filter);
   state.timer = setTimeout(async () => {
     try {
-      const all = await ask({ op: "search", q: text, code, meaning: true, limit: LIMIT });
+      const all = await ask({ generation, op: "search", q: text, code, meaning: true, limit: LIMIT });
       const shown = filter && !code
-        ? await ask({ op: "search", q: text, code, meaning: true, limit: LIMIT, kinds: filter.kinds }) : all;
-      if (generation !== state.generation) return;
+        ? await ask({ generation, op: "search", q: text, code, meaning: true, limit: LIMIT, kinds: filter.kinds }) : all;
+      if (generation !== state.generation || shown.cancelled) return;
       const counts = {};
       if (code) counts.code = all.strong;
       else for (const hit of all.hits.slice(0, all.strong)) {
@@ -238,7 +238,7 @@ function cellPicture(hit) {
   if (what) {
     const image = element("img", hit.kind === "pdf" ? "page" : "");
     image.alt = "";
-    image.dataset.render = JSON.stringify([...what, Math.round(240 * (window.devicePixelRatio || 1))]);
+    image.dataset.render = JSON.stringify([...what, Math.round(240 * (window.devicePixelRatio || 1)), hit.modified, hit.size]);
     thumbnails.observe(image);
     return image;
   }
@@ -263,9 +263,9 @@ const thumbnails = new IntersectionObserver((entries) => {
     if (!entry.isIntersecting) continue;
     const image = entry.target;
     thumbnails.unobserve(image);
-    const [kind, loc, pixels] = JSON.parse(image.dataset.render);
+    const [kind, loc, pixels, modified, size] = JSON.parse(image.dataset.render);
     const path = image.closest("[data-path]").dataset.path;
-    rendered(path, kind, loc, pixels)
+    rendered(path, kind, loc, pixels, modified, size)
       .then((file) => {
         image.src = fileURL(file);
         image.closest("[data-path]").dataset.thumb = file;   // the picture under the pointer when it's dragged out
@@ -583,9 +583,9 @@ function previewPicture(hit) {
   image.alt = "";
   frame.append(image);
   // The cell's picture first (already drawn), then the bigger one.
-  const small = renders.get(`${hit.path}|${what[0]}|${what[1]}|${Math.round(240 * (window.devicePixelRatio || 1))}`);
+  const small = renders.get(renderKey(hit.path, what[0], what[1], Math.round(240 * (window.devicePixelRatio || 1)), hit.modified, hit.size));
   small?.then((file) => { if (!image.dataset.big) image.src = fileURL(file); }).catch(() => {});
-  rendered(hit.path, what[0], what[1], Math.round(300 * (window.devicePixelRatio || 1)))
+  rendered(hit.path, what[0], what[1], Math.round(300 * (window.devicePixelRatio || 1)), hit.modified, hit.size)
     .then((file) => { image.dataset.big = "1"; image.src = fileURL(file); })
     .catch(() => {});
   image.ondblclick = () => open(hit);
@@ -688,7 +688,7 @@ function bigView(hit) {
     image.src = fileURL(hit.path);
   } else {
     const pixels = Math.round(Math.max(innerWidth, innerHeight) * (window.devicePixelRatio || 1));
-    rendered(hit.path, what[0], what[1], pixels).then((file) => { image.src = fileURL(file); }).catch(() => {});
+    rendered(hit.path, what[0], what[1], pixels, hit.modified, hit.size).then((file) => { image.src = fileURL(file); }).catch(() => {});
   }
   image.ondblclick = () => { closeBig(); open(hit); };
   view.append(image);
@@ -1196,3 +1196,8 @@ function report() {
 }
 
 start();
+
+// Existing results repaint after the helper replaces its temporary previews.
+window.addEventListener("preview-generation", () => {
+  if (state.hasResults) render();
+});

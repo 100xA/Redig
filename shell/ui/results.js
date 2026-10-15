@@ -5,7 +5,8 @@
 
 const tauri = window.__TAURI__;
 const invoke = (command, args) => tauri.core.invoke(command, args);
-const ask = (request) => invoke("ask", { request });
+const SEARCH_CLIENT = `${location.pathname}:${Date.now()}:${Math.random()}`;
+const ask = (request) => invoke("ask", { request: { ...request, client: SEARCH_CLIENT } });
 const fileURL = (path) => tauri.core.convertFileSrc(path);
 
 const isMac = /Mac/.test(navigator.platform);
@@ -235,11 +236,36 @@ function kindIcon(kind) {
 
 /// The helper's JPEG of a page, a frame or a picture, asked for once per file and place.
 const renders = new Map();
-function rendered(path, kind, loc, pixels) {
-  const key = `${path}|${kind}|${loc}|${pixels}`;
-  if (!renders.has(key)) renders.set(key, ask({ op: "render", path, kind, loc, pixels }).then((reply) => reply.image));
-  return renders.get(key);
+const MAX_RENDERS = 256;
+let helperGeneration = 0;
+function renderKey(path, kind, loc, pixels, modified = 0, size = 0) {
+  return `${helperGeneration}|${path}|${modified}|${size}|${kind}|${loc}|${pixels}`;
 }
+function rendered(path, kind, loc, pixels, modified = 0, size = 0) {
+  const key = renderKey(path, kind, loc, pixels, modified, size);
+  if (renders.has(key)) {
+    const cached = renders.get(key);
+    renders.delete(key);
+    renders.set(key, cached);
+    return cached;
+  }
+  const pending = ask({ op: "render", path, kind, loc, pixels }).then((reply) => reply.image);
+  renders.set(key, pending);
+  pending.catch(() => { if (renders.get(key) === pending) renders.delete(key); });
+  while (renders.size > MAX_RENDERS) renders.delete(renders.keys().next().value);
+  return pending;
+}
+// A replacement helper clears its preview directory. No webview may reuse paths from the old generation.
+tauri.event.listen("helper", ({ payload: { from, event } }) => {
+  if (from !== "search") return;
+  if (event.event === "generation" && event.generation > helperGeneration) {
+    helperGeneration = event.generation;
+    renders.clear();
+    if (window.dispatchEvent) window.dispatchEvent(new Event("preview-generation"));
+  } else if (event.event === "exit" && event.generation === helperGeneration) {
+    renders.clear();
+  }
+});
 
 /// What the helper renders for a result's picture: [kind, place], or null when it has none (documents, audio, code).
 function renderOf(hit) {

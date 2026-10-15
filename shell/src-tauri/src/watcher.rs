@@ -7,7 +7,8 @@
 
 use notify::{RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Folders the crawl never walks into, by name: the engine's `Rules.skippedFolderNames`.
@@ -16,6 +17,7 @@ const DEVELOPER_FOLDERS: [&str; 8] =
 
 pub struct FolderWatcher {
     _watcher: Option<notify::RecommendedWatcher>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl FolderWatcher {
@@ -23,7 +25,8 @@ impl FolderWatcher {
     /// changes: once nothing has changed for `quiet`, or `longest` after the burst began. Dropping it stops.
     pub fn start(folders: &[PathBuf], skipped: Vec<PathBuf>, ignore: Option<PathBuf>, quiet: Duration, longest: Duration,
                  changed: impl Fn() + Send + 'static) -> FolderWatcher {
-        let (sender, receiver) = mpsc::channel::<()>();
+        let (sender, receiver) = mpsc::sync_channel::<()>(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
         let roots = folders.to_vec();
         let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
             let Ok(event) = result else { return };
@@ -33,14 +36,14 @@ impl FolderWatcher {
             let ours = |path: &PathBuf| ignore.as_ref().is_some_and(|folder| path.starts_with(folder));
             // No paths: the system dropped events (an overflow), so anything may have changed.
             if event.paths.is_empty() || event.paths.iter().any(|path| !ours(path) && walked(path, &roots, &skipped)) {
-                let _ = sender.send(());
+                let _ = sender.try_send(());
             }
         });
         let mut watcher = match watcher {
             Ok(watcher) => watcher,
             Err(error) => {
                 eprintln!("digup-shell: can't watch folders: {error}");
-                return FolderWatcher { _watcher: None };
+                return FolderWatcher { _watcher: None, cancelled };
             }
         };
         for folder in folders {
@@ -48,20 +51,37 @@ impl FolderWatcher {
                 eprintln!("digup-shell: can't watch {}: {error}", folder.display());
             }
         }
+        let stopped = cancelled.clone();
         std::thread::spawn(move || {
-            while receiver.recv().is_ok() {
+            'watch: while receiver.recv().is_ok() {
                 let began = std::time::Instant::now();
-                while began.elapsed() < longest && receiver.recv_timeout(quiet).is_ok() {}
+                loop {
+                    let Some(remaining) = longest.checked_sub(began.elapsed()) else { break };
+                    match receiver.recv_timeout(quiet.min(remaining)) {
+                        Ok(()) => {},
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'watch,
+                    }
+                }
+                if stopped.load(Ordering::Acquire) { break; }
                 changed();
             }
         });
-        FolderWatcher { _watcher: Some(watcher) }
+        FolderWatcher { _watcher: Some(watcher), cancelled }
     }
+}
+
+impl Drop for FolderWatcher {
+    fn drop(&mut self) { self.cancelled.store(true, Ordering::Release); }
 }
 
 /// The crawl reads `path`: it's inside a chosen folder, and nothing on the way to it from there is skipped. A skipped
 /// folder counts only inside the chosen folders that contain it (one chosen inside it is read whole).
 fn walked(path: &Path, roots: &[PathBuf], skipped: &[PathBuf]) -> bool {
+    // These hidden control files change the set of readable source files. Check their enclosing repository/folder,
+    // so the normal hidden-cache filter cannot swallow a policy change.
+    let control = policy_parent(path);
+    let path = control.as_deref().unwrap_or(path);
     roots.iter().any(|root| {
         let Ok(below) = path.strip_prefix(root) else { return false };
         let mut folder = root.clone();
@@ -75,6 +95,15 @@ fn walked(path: &Path, roots: &[PathBuf], skipped: &[PathBuf]) -> bool {
                 || hidden(&folder))
         })
     })
+}
+
+fn policy_parent(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy();
+    if name == ".gitignore" || name == ".git" { return path.parent().map(Path::to_path_buf); }
+    if path.ends_with(Path::new(".git/info/exclude")) {
+        return path.parent()?.parent()?.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 /// Windows' hidden flag; elsewhere a leading dot is the rule, checked above.
@@ -102,6 +131,11 @@ mod tests {
         let skipped = vec![home.join("Music"), home.join("Music/Mixes")];
         let read = |path: &str| walked(&home.join(path), &roots, &skipped);
         assert!(read("Documents/notes.md"));
+        assert!(read("code/app/.gitignore"));
+        assert!(read("code/app/.git"));
+        assert!(read("code/app/.git/info/exclude"));
+        assert!(!read("code/app/.git/objects/abc"));
+        assert!(!read("Music/.gitignore"));
         assert!(!read(".cache/thumbnails/x.png"));
         assert!(!read("code/app/node_modules/pkg/index.js"));
         assert!(!read("Archive.noindex/old.pdf"));

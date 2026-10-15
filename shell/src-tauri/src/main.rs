@@ -830,10 +830,9 @@ fn apply_folders(app: &AppHandle) {
         let _ = app.asset_protocol_scope().allow_directory(folder, true);
     }
     let request = folders_request(&shell);
-    let search = shell.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = search.search.ask(request).await;
-    });
+    if let Err(error) = shell.search.configure(request) {
+        eprintln!("can't configure search: {error}");
+    }
     watch_folders(app);
 }
 
@@ -1388,8 +1387,8 @@ fn turn_off_code(app: AppHandle, shell: State<'_, Arc<Shell>>) -> Result<(), Str
     }
     let shell = shell.inner().clone();
     let request = folders_request(&shell);
+    let _ = shell.search.configure(request);
     tauri::async_runtime::spawn(async move {
-        let _ = shell.search.ask(request).await;
         // Stopped rather than asked to sync: one still reading code holds the code index until it's done.
         shell.index.stop();
         watch_folders(&app);
@@ -1799,6 +1798,8 @@ fn model_event(app: &AppHandle, event: Value) {
     let _ = app.emit("model", state);
     changed(app);
     if ready {
+        let search = shell.clone();
+        tauri::async_runtime::spawn(async move { let _ = search.search.ask(json!({"op": "prewarm"})).await; });
         measure_then_index(app);
     }
 }

@@ -361,19 +361,35 @@ public final class LlamaEmbedder: Embedder {
         var folders: [String] = []
         if let chosen = environment["DIGUP_BACKENDS"], !chosen.isEmpty { folders.append(chosen) }
         if let executable = Bundle.main.executableURL { folders.append(executable.deletingLastPathComponent().path) }
-        for folder in folders where ggml_backend_dev_count() == 0 {
-            ggml_backend_load_all_from_path(folder)
-        }
-        if ggml_backend_dev_count() == 0 { ggml_backend_load_all() }
-        gpuFound = (0..<ggml_backend_dev_count()).contains { isGPU(ggml_backend_dev_get($0)) }
         if cpuOnly {
-            // Unloaded rather than just unused: a GPU backend would still set itself up (Vulkan: seconds).
-            for index in (0..<ggml_backend_reg_count()).reversed() {
-                let registry = ggml_backend_reg_get(index)
-                if (0..<ggml_backend_reg_dev_count(registry)).contains(where: { isGPU(ggml_backend_reg_dev_get(registry, $0)) }) {
-                    ggml_backend_unload(registry)
+            // Loading all registries and unloading the GPU afterwards still initializes its driver. Probe only CPU
+            // modules, the same compatibility scores ggml uses to pick an instruction-set variant.
+            folders.append(URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().appendingPathComponent("Vendor/llama/lib").path)
+            folders.append(FileManager.default.currentDirectoryPath)
+            for folder in folders {
+                var candidates: [(path: String, score: Int32)] = []
+                for name in (try? FileManager.default.contentsOfDirectory(atPath: folder)) ?? [] {
+                    #if os(Windows)
+                    let candidate = name.hasPrefix("ggml-cpu") && name.hasSuffix(".dll")
+                    let base = name == "ggml-cpu.dll"
+                    #else
+                    let candidate = name.hasPrefix("libggml-cpu") && name.hasSuffix(".so")
+                    let base = name == "libggml-cpu.so"
+                    #endif
+                    guard candidate else { continue }
+                    let path = URL(fileURLWithPath: folder).appendingPathComponent(name).path
+                    let score = digup_cpu_backend_score(path)
+                    guard score > 0 || (score == 0 && base) else { continue }
+                    candidates.append((path, score))
                 }
+                let loaded = candidates.sorted { $0.score > $1.score }.contains { ggml_backend_load($0.path) != nil }
+                if loaded { break }
             }
+        } else {
+            for folder in folders where ggml_backend_dev_count() == 0 { ggml_backend_load_all_from_path(folder) }
+            if ggml_backend_dev_count() == 0 { ggml_backend_load_all() }
+            gpuFound = (0..<ggml_backend_dev_count()).contains { isGPU(ggml_backend_dev_get($0)) }
         }
         LlamaLog.shared.line("backends: " + (0..<ggml_backend_reg_count()).map {
             String(cString: ggml_backend_reg_name(ggml_backend_reg_get($0)))

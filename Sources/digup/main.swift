@@ -350,14 +350,12 @@ func statesLine(_ states: [String: Int]) -> String {
 /// Embeds queries with the text model alone (0.3B params, ~0.25 GB): the query encoder. `prompt`: the search's
 /// (`Prompts.query`, or `Prompts.codeQuery` for the code index).
 func queryVectors(_ queries: [String], store: IndexStore, searcher: Searcher,
-                  prompt: (String) -> String = Prompts.query) throws -> [[Float]]? {
+                  prompt: (String) -> String = Prompts.query) throws -> [Searcher.QueryVector]? {
     guard searcher.vectorCount > 0, !queries.isEmpty else { return nil }
     let worker = try makeEmbedder(textOnly: true, log: store.directory.appendingPathComponent("worker-query.log"))
     defer { worker.close() }
-    if let source = searcher.vectorSource, source != worker.info.vectorSource {
-        throw CLIError("index vectors come from \(source) but the query encoder is \(worker.info.vectorSource)")
-    }
-    return try worker.embedTexts(queries.map(prompt))
+    let source = worker.info.vectorSource
+    return try worker.embedTexts(queries.map(prompt)).map { Searcher.QueryVector(values: $0, source: source) }
 }
 
 func search(_ args: Arguments) throws {
@@ -372,7 +370,7 @@ func search(_ args: Arguments) throws {
     let vector = try queryVectors([query], store: store, searcher: searcher,
                                   prompt: code == nil ? Prompts.query : Prompts.codeQuery)?.first
     let encoded = Date()
-    let hits = try searcher.search(query, queryVector: vector, kinds: try args.kinds(),
+    let hits = try searcher.search(query, query: vector, kinds: try args.kinds(),
                                    limit: args.values["-n"].flatMap(Int.init) ?? 10, zGate: args.zGate,
                                    wordWeight: args.wordWeight)
     let searched = Date()
@@ -407,7 +405,7 @@ func status(_ args: Arguments) throws {
         print("  \(pad(kind.rawValue, 11)) \(lpad(number(total), 6))   " + statesLine(states))
     }
     if counts.unfinished > 0 {
-        print("long files still being read: \(number(counts.unfinished)) (\(number(counts.left)) pages and chunks left)")
+        print("long files still being read: \(number(counts.unfinished)) (\(number(counts.left)) pages, chunks and media windows left)")
     }
     if let fingerprint = try store.meta("fingerprint") { print("built with: \(fingerprint)") }
     print("this digup: llama.cpp \(LlamaEmbedder.buildTag), vectors \(LlamaEmbedder.vectorVersion)")
@@ -478,12 +476,12 @@ func speed(_ args: Arguments) throws {
 
 /// The model timed on the processor alone, in a process of its own (llama.cpp loads its backends once a process), with
 /// the vectors it made, and how long it took to load.
-func processorAlone(folder: URL, tries: Int) throws -> (measured: ModelSpeed.Measurement, load: Double) {
+func processorAlone(folder: URL, tries: Int, device: String = "cpu") throws -> (measured: ModelSpeed.Measurement, load: Double) {
     guard let program = Bundle.main.executableURL else { throw CLIError("where is digup?") }
     let process = Process()
     process.executableURL = program
     process.arguments = ["speed", "--model", "--measure-only", "--json", "--tries", String(tries), "--index", folder.path]
-    process.environment = ProcessInfo.processInfo.environment.merging(["DIGUP_DEVICE": "cpu"]) { $1 }
+    process.environment = ProcessInfo.processInfo.environment.merging(["DIGUP_DEVICE": device]) { $1 }
     let output = Pipe()
     process.standardOutput = output
     try process.run()
@@ -494,7 +492,7 @@ func processorAlone(folder: URL, tries: Int) throws -> (measured: ModelSpeed.Mea
           let reply = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
           let seconds = reply["seconds"] as? [String: Double], let load = reply["load"] as? Double,
           let times = ModelSpeed.Times(fields: seconds)
-    else { throw CLIError("the processor's speed check failed") }
+    else { throw CLIError("the \(device) speed check failed (exit \(process.terminationStatus))") }
     let vectors = (reply["vectors"] as? [String: [Double]] ?? [:]).mapValues { $0.map(Float.init) }
     return (ModelSpeed.Measurement(times: times, vectors: vectors, tries: reply["tries"] as? [Double] ?? [],
                                    steady: reply["steady"] as? Bool ?? true, others: reply["others"] as? Double ?? 0),
@@ -543,22 +541,40 @@ func modelSpeed(_ args: Arguments) throws {
         ?? (waited: 0, settled: true, calmest: nil)
     let started = Date()
     let alone = compares ? try processorAlone(folder: folder, tries: tries) : nil
-    let loading = Date()
-    let model = try makeEmbedder(textOnly: false, log: log)
-    var load = Date().timeIntervalSince(loading)
-    let measured = try ModelSpeed.measure(model, tries: tries, rival: alone?.measured.total)
-    model.close()
-    var (kept, other) = (measured, alone?.measured)
+    var load = 0.0
+    var kept: ModelSpeed.Measurement
+    var other: ModelSpeed.Measurement?
     var compared: [String: Any] = [:]
-    if let alone {
-        let agreement = ModelSpeed.agreement(measured.vectors, alone.measured.vectors)
-        func fields(_ run: ModelSpeed.Measurement, load: Double) -> [String: Any] {
-            ["seconds": run.times.fields, "load": load, "tries": run.tries, "steady": run.steady, "others": run.others]
+    do {
+        let measured: ModelSpeed.Measurement
+        if alone != nil {
+            // A failing GPU driver must not discard a working CPU baseline or crash the calibrating parent.
+            let gpu = try processorAlone(folder: folder, tries: tries, device: "gpu")
+            (measured, load) = (gpu.measured, gpu.load)
+        } else {
+            let loading = Date()
+            let model = try makeEmbedder(textOnly: false, log: log)
+            defer { model.close() }
+            load = Date().timeIntervalSince(loading)
+            measured = try ModelSpeed.measure(model, tries: tries)
         }
-        compared = ["gpu": fields(measured, load: load), "cpu": fields(alone.measured, load: alone.load),
-                    "agreement": agreement]
-        speed.device = agreement >= 0.999 && measured.total <= alone.measured.total ? "gpu" : "cpu"
-        if speed.device == "cpu" { (kept, other, load) = (alone.measured, measured, alone.load) }
+        (kept, other) = (measured, alone?.measured)
+        if let alone {
+            let agreement = ModelSpeed.agreement(measured.vectors, alone.measured.vectors)
+            func fields(_ run: ModelSpeed.Measurement, load: Double) -> [String: Any] {
+                ["seconds": run.times.fields, "load": load, "tries": run.tries, "steady": run.steady, "others": run.others]
+            }
+            compared = ["gpu": fields(measured, load: load), "cpu": fields(alone.measured, load: alone.load),
+                        "agreement": agreement]
+            speed.device = agreement >= 0.999 && measured.total <= alone.measured.total ? "gpu" : "cpu"
+            if speed.device == "cpu" { (kept, other, load) = (alone.measured, measured, alone.load) }
+        }
+    } catch {
+        guard let alone else { throw error }
+        (kept, other, load) = (alone.measured, nil, alone.load)
+        speed.device = "cpu"
+        compared["gpu_error"] = String("\(error)".prefix(500))
+        FileHandle.standardError.write(Data("GPU speed check failed; keeping the working CPU baseline: \(error)\n".utf8))
     }
     // Close times from a run whose best wasn't seen twice could have gone the other way. (Other programs' work while it
     // timed isn't a reason: with every processor busy, the system's count and this process's differ by more than they
@@ -622,7 +638,7 @@ func evaluate(_ args: Arguments) throws {
     let isCode = eval.queries.map { CodeQuery.text(of: $0.q) != nil }
     let texts = eval.queries.map { CodeQuery.text(of: $0.q) ?? $0.q }
     var searchers: [Bool: Searcher] = [:]
-    var vectors = [[Float]?](repeating: nil, count: texts.count)
+    var vectors = [Searcher.QueryVector?](repeating: nil, count: texts.count)
     for code in Set(isCode) {
         let store = try IndexStore(directory: args.indexFolder, file: code ? IndexStore.codeFile : IndexStore.mainFile)
         let searcher = try Searcher(store: store)
@@ -638,7 +654,7 @@ func evaluate(_ args: Arguments) throws {
     var shown = 0, listed = 0, folded = 0   // the app's weaker-matches fold (Searcher.strongCount), over all queries
     for (index, query) in eval.queries.enumerated() {
         let kinds = query.kind.flatMap { FileKind(rawValue: $0) }.map { Set([$0]) }
-        let hits = try searchers[isCode[index]]!.search(texts[index], queryVector: vectors[index], kinds: kinds,
+        let hits = try searchers[isCode[index]]!.search(texts[index], query: vectors[index], kinds: kinds,
                                                        limit: depth, zGate: args.zGate, wordWeight: args.wordWeight)
         let strong = Searcher.strongCount(hits)
         shown += strong
@@ -698,7 +714,8 @@ do {
     }
     let args = try Arguments(raw.dropFirst())
     if ["index-service", "worker", "search-service", "download-model"].contains(command)
-        || command == "estimate" && args.flags.contains("--json") {
+        || command == "estimate" && args.flags.contains("--json")
+        || command == "speed" && args.flags.contains("--measure-only") {
         ParentWatch.start()   // an app's helper goes when the app does
     }
     // Where this machine's speed check found its processor faster than its GPU, the model runs on the processor.

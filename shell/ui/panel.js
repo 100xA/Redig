@@ -60,17 +60,17 @@ function queryChanged() {
     return;
   }
   // Words now. The last word is probably half-typed, so it matches as a prefix.
-  ask({ op: "search", q: text, code, meaning: false, prefix_last: true, limit: 40 })
+  ask({ generation, op: "search", q: text, code, meaning: false, prefix_last: true, limit: 40 })
     .then((reply) => {
       if (generation === state.generation && state.finalGeneration !== generation) show(reply, text, "words");
     })
     .catch(failed);
   // The meaning is embedded now, so its vector is ready when typing pauses: the pause is the whole wait.
-  ask({ op: "embed_ahead", q: text, code }).catch(() => {});
+  ask({ generation, op: "embed_ahead", q: text, code }).catch(() => {});
   state.timer = setTimeout(() => {
-    ask({ op: "search", q: text, code, meaning: true, limit: 40 })
+    ask({ generation, op: "search", q: text, code, meaning: true, limit: 40 })
       .then((reply) => {
-        if (generation !== state.generation) return;
+        if (generation !== state.generation || reply?.cancelled) return;
         state.finalGeneration = generation;
         show(reply, text, reply.meaning ? "meaning" : "wordsOnly");
         if (debugPending) report();
@@ -244,7 +244,7 @@ function thumbnail(hit) {
   if (!what) return kindIcon(hit.kind);
   const image = element("img", "thumb");
   image.alt = "";
-  rendered(hit.path, what[0], what[1], pixels)
+  rendered(hit.path, what[0], what[1], pixels, hit.modified, hit.size)
     .then((path) => { image.src = fileURL(path); })
     .catch(() => image.replaceWith(kindIcon(hit.kind)));
   return image;
@@ -296,15 +296,15 @@ function picture(hit) {
     case "image":
     case "screenshot":
       if (SHOWN_AS_IS.has(extensionOf(hit.path))) image.src = fileURL(hit.path);
-      else rendered(hit.path, "image", null, 1024).then((path) => { image.src = fileURL(path); }).catch(() => {});
+      else rendered(hit.path, "image", null, 1024, hit.modified, hit.size).then((path) => { image.src = fileURL(path); }).catch(() => {});
       return frame;
     case "pdf":
-      rendered(hit.path, "pdf", hit.loc ?? 1, 1024).then((path) => { image.src = fileURL(path); }).catch(() => {});
+      rendered(hit.path, "pdf", hit.loc ?? 1, 1024, hit.modified, hit.size).then((path) => { image.src = fileURL(path); }).catch(() => {});
       return frame;
     case "video": {
       // The frame at the moment, its time on it; a click plays the video from there.
       const at = hit.loc ?? 0;
-      rendered(hit.path, "video", at, 1024).then((path) => { image.src = fileURL(path); }).catch(() => {});
+      rendered(hit.path, "video", at, 1024, hit.modified, hit.size).then((path) => { image.src = fileURL(path); }).catch(() => {});
       const moment = element("div", "moment");
       const play = element("div", "play");
       play.innerHTML = ICONS.play;
@@ -555,3 +555,8 @@ function report() {
     }).catch(() => {});
   }, 1500);
 }
+
+// Existing results repaint after the helper replaces its temporary previews.
+window.addEventListener("preview-generation", () => {
+  if (state.strong.length || state.weaker.length) render();
+});

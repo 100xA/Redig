@@ -52,6 +52,8 @@ final class IndexService: @unchecked Sendable {
     private let lock = NSLock()
     private var syncRequested = true       // the first thing it does
     private var codeSyncRequested = true
+    private var syncGeneration: UInt64 = 0
+    private var codeSyncGeneration: UInt64 = 0
     private var stopRequested = false
     private var backfillAllowed: Bool
     /// A sync asked for while files are being indexed waits until then. A crawl of a big folder can take minutes, and
@@ -102,16 +104,12 @@ final class IndexService: @unchecked Sendable {
         var newFiles = Set<Int64>(), newCode = Set<Int64>()
         var codeCounted = code == nil
         while true {
-            if lock.withLock({ () -> Bool in defer { syncRequested = false }; return syncRequested }) {
-                sync(main, into: &newFiles)
-            }
+            if let generation = takeSync(code: false) { sync(main, into: &newFiles, generation: generation) }
             // The code folders are crawled with the first sync, so their counts show from the start (a big first pass
             // of the main index takes hours); their files are read once the main index has nothing waiting, below.
             if !codeCounted, let code {
                 codeCounted = true
-                if lock.withLock({ () -> Bool in defer { codeSyncRequested = false }; return codeSyncRequested }) {
-                    sync(code, into: &newCode)
-                }
+                if let generation = takeSync(code: true) { sync(code, into: &newCode, generation: generation) }
             }
             if lock.withLock({ stopRequested }) { break }
             guard modelReady() else {
@@ -131,9 +129,7 @@ final class IndexService: @unchecked Sendable {
             // The code index once the main one has nothing waiting: its own sync (code changes come in a while after
             // they settle), what it just queued at once, the rest under the backfill's rules.
             if let code, (try? main.store.pendingCount()) ?? 1 == 0 || !lock.withLock({ backfillAllowed }) {
-                if lock.withLock({ () -> Bool in defer { codeSyncRequested = false }; return codeSyncRequested }) {
-                    sync(code, into: &newCode)
-                }
+                if let generation = takeSync(code: true) { sync(code, into: &newCode, generation: generation) }
                 if !newCode.isEmpty {
                     guard run(code, only: newCode) else { break }
                     newCode = left(code, of: newCode)
@@ -208,8 +204,22 @@ final class IndexService: @unchecked Sendable {
         return available
     }
 
-    private func sync(_ part: Part, into newFiles: inout Set<Int64>) {
+    private func takeSync(code: Bool) -> UInt64? {
+        lock.withLock {
+            if code {
+                guard codeSyncRequested else { return nil }
+                codeSyncRequested = false
+                return codeSyncGeneration
+            }
+            guard syncRequested else { return nil }
+            syncRequested = false
+            return syncGeneration
+        }
+    }
+
+    private func sync(_ part: Part, into newFiles: inout Set<Int64>, generation: UInt64) {
         let started = Date()
+        emit(["event": "sync_started", "code": part.code, "generation": generation])
         defer {
             let took = Date().timeIntervalSince(started)
             lock.withLock { yieldAt = Date() + max(took, 2) }
@@ -302,9 +312,20 @@ final class IndexService: @unchecked Sendable {
     private func readCommands() {
         while let line = readLine() {
             lock.withLock {
-                switch line.trimmingCharacters(in: .whitespaces) {
-                case "sync": syncRequested = true
-                case "sync code": codeSyncRequested = true
+                let command = line.trimmingCharacters(in: .whitespaces)
+                let words = command.split(separator: " ")
+                if words.first == "sync" {
+                    let code = words.dropFirst().first == "code"
+                    let generation = words.last.flatMap { UInt64($0) } ?? 0
+                    if code {
+                        codeSyncRequested = true
+                        codeSyncGeneration = max(codeSyncGeneration, generation)
+                    } else {
+                        syncRequested = true
+                        syncGeneration = max(syncGeneration, generation)
+                    }
+                }
+                switch command {
                 case "stop": stopRequested = true
                 case "backfill on": backfillAllowed = true
                 case "backfill off": backfillAllowed = false

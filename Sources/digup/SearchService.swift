@@ -31,28 +31,41 @@ import Foundation
 ///   {"op":"quit"}                             → {"ok":true}, then exit
 /// The encoder exits after `--encoder-idle` seconds without a query and the vectors are released (as in the app);
 /// keyword search keeps working and the next query brings both back.
-final class SearchService: @unchecked Sendable {   // its state is guarded by `lock`
+final class SearchService: @unchecked Sendable {   // search/encoder queues own their state; stateLock guards admission
     private let directory: URL
     private var store: IndexStore
     private var searcher: Searcher
     private var codeStore: IndexStore?
     private var codeSearcher: Searcher?
     private var roots: [String], skipped: [String], types: Set<String>, codeRoots: [String], codeSkipped: [String]
+    private var searchedRoots: [String] = [], searchedSkipped: [String] = []
+    private var searchedCodeRoots: [String] = [], searchedCodeSkipped: [String] = []
     private let idleSeconds: Double
     private let log: URL
 
     private var encoder: (any Embedder)?
     private var encoderState = "stopped"
-    private var vectorCache: [String: [Float]] = [:]
+    private var vectorCache: [String: Searcher.QueryVector] = [:] // encoderQueue only
+    private var retryEncoderAt = Date.distantPast
+    private let searchQueue = DispatchQueue(label: "DigUp.search-service.search", qos: .userInitiated)
+    private let encoderQueue = DispatchQueue(label: "DigUp.search-service.encoder", qos: .userInitiated)
+    private let stateLock = NSLock()
     private var lastQuery = Date()
-    private var warnedAboutSource = false
-    private let lock = NSLock()
+    private var newest: [String: Int] = [:]
+    private var stopping = false
     private let output = NSLock()
     /// Renders for previews: two at a time, beside the request loop, each made once per file version.
     private let previews: URL
     private var rendered: [String: String] = [:]
     private let renderLock = NSLock()
-    private let renderSlots = DispatchSemaphore(value: 2)
+    private let renderQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "DigUp.search-service.previews"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .utility
+        return queue
+    }()
+    private var renderRequests = 0
 
     init(index: URL, roots: [String], skipped: [String], types: Set<String>, codeRoots: [String],
          codeSkipped: [String], idleSeconds: Double) throws {
@@ -69,7 +82,18 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
         previews = index.appendingPathComponent("previews")
         try? FileManager.default.removeItem(at: previews)
         try FileManager.default.createDirectory(at: previews, withIntermediateDirectories: true)
+        updateScope()
         try openCode()
+    }
+
+    private func updateScope() {
+        func spellings(_ paths: [String]) -> [String] {
+            Array(Set(paths.flatMap { [$0, FolderSelection.realPath($0)] }))
+        }
+        searchedRoots = spellings(roots)
+        searchedSkipped = spellings(skipped)
+        searchedCodeRoots = spellings(codeRoots)
+        searchedCodeSkipped = spellings(codeSkipped)
     }
 
     /// The code index is open while there are code folders: without any, a shell can delete it (Windows won't delete an
@@ -85,103 +109,137 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
         Thread.detachNewThread { [self] in idleWatch() }
         while let line = readLine() {
             guard let data = line.data(using: .utf8),
-                  let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            let id: Any = request["id"] ?? NSNull()
-            var reply: [String: Any]
-            do {
-                guard let op = request["op"] as? String else { throw CLIError("no op") }
-                if op == "quit" {
-                    write(["id": id, "ok": true])
-                    lock.withLock { stopEncoder() }
-                    return 0
-                }
-                if op == "render" {
-                    renderSlots.wait()
-                    let request = UncheckedSendable(request)
-                    Thread.detachNewThread { [self] in
-                        defer { renderSlots.signal() }
-                        var reply: [String: Any]
-                        do { reply = try render(request.value) } catch {
-                            reply = ["ok": false, "error": String("\(error)".prefix(500))]
-                        }
-                        reply["id"] = request.value["id"] ?? NSNull()
-                        write(reply)
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let request = UncheckedSendable(fields)
+            let op = fields["op"] as? String ?? ""
+            if op == "quit" {
+                stateLock.withLock { stopping = true }
+                renderQueue.cancelAllOperations()
+                encoderQueue.sync { stopEncoder() }
+                searchQueue.sync {}
+                reply(["ok": true], to: fields)
+                return 0
+            }
+            if op == "search" || op == "embed_ahead" || op == "prewarm" {
+                stateLock.withLock {
+                    lastQuery = Date()
+                    if let generation = fields["generation"] as? Int {
+                        let client = fields["client"] as? String ?? "default"
+                        newest[client] = max(newest[client] ?? generation, generation)
                     }
+                }
+            }
+            if op == "render" {
+                // Admission is bounded, but the reader never waits for a renderer or decoder.
+                let admitted = stateLock.withLock { () -> Bool in
+                    guard renderRequests < 64 else { return false }
+                    renderRequests += 1
+                    return true
+                }
+                guard admitted else {
+                    reply(["ok": false, "error": "preview queue is full; try again"], to: fields)
                     continue
                 }
-                reply = try lock.withLock { try handle(op, request) }
-            } catch {
-                reply = ["ok": false, "error": String("\(error)".prefix(500))]
+                renderQueue.addOperation { [self] in
+                    defer { stateLock.withLock { renderRequests -= 1 } }
+                    do { reply(try render(request.value), to: request.value) }
+                    catch { reply(["ok": false, "error": String("\(error)".prefix(500))], to: request.value) }
+                }
+            } else if op == "embed_ahead" {
+                // A reply acknowledges admission; obsolete queued inference is discarded before it starts.
+                reply(["ok": true], to: fields)
+                encoderQueue.async { [self] in
+                    guard current(request.value) else { return }
+                    _ = vector(for: request.value["q"] as? String ?? "", code: request.value["code"] as? Bool ?? false)
+                }
+            } else if op == "prewarm" {
+                encoderQueue.async { [self] in
+                    retryEncoderAt = .distantPast // a new panel opening/model arrival is a fresh chance
+                    _ = runningEncoder()
+                }
+                searchQueue.async { [self] in
+                    do {
+                        if !searcher.vectorsLoaded { try searcher.reload() }
+                        reply(["ok": true, "encoder": stateLock.withLock { encoderState }, "vectors": searcher.vectorCount],
+                              to: request.value)
+                    } catch { reply(["ok": false, "error": "\(error)"], to: request.value) }
+                }
+            } else if op == "search", fields["meaning"] as? Bool ?? true {
+                encoderQueue.async { [self] in
+                    guard current(request.value) else { cancel(request.value); return }
+                    let text = request.value["q"] as? String ?? ""
+                    let started = Date()
+                    let vector = text.isEmpty ? nil : vector(for: text, code: request.value["code"] as? Bool ?? false)
+                    let embedMS = Int(Date().timeIntervalSince(started) * 1000)
+                    searchQueue.async { [self] in perform(op, request.value, vector: vector, embedMS: embedMS) }
+                }
+            } else {
+                searchQueue.async { [self] in perform(op, request.value) }
             }
-            reply["id"] = id
-            write(reply)
         }
-        lock.withLock { stopEncoder() }
+        stateLock.withLock { stopping = true }
+        renderQueue.cancelAllOperations()
+        encoderQueue.sync { stopEncoder() }
+        searchQueue.sync {}
         return 0
     }
 
-    private func handle(_ op: String, _ request: [String: Any]) throws -> [String: Any] {
+    private func current(_ request: [String: Any]) -> Bool {
+        stateLock.withLock {
+            guard !stopping else { return false }
+            guard let generation = request["generation"] as? Int else { return true }
+            return newest[request["client"] as? String ?? "default"] == generation
+        }
+    }
+
+    private func cancel(_ request: [String: Any]) {
+        reply(["ok": true, "cancelled": true, "hits": [], "strong": 0, "meaning": false], to: request)
+    }
+
+    private func reply(_ fields: [String: Any], to request: [String: Any]) {
+        var fields = fields
+        fields["id"] = request["id"] ?? NSNull()
+        write(fields)
+    }
+
+    private func perform(_ op: String, _ request: [String: Any], vector: Searcher.QueryVector? = nil, embedMS: Int = 0) {
+        if op == "search", !current(request) { cancel(request); return }
+        do { reply(try handle(op, request, vector: vector, embedMS: embedMS), to: request) }
+        catch { reply(["ok": false, "error": String("\(error)".prefix(500))], to: request) }
+    }
+
+    private func handle(_ op: String, _ request: [String: Any], vector: Searcher.QueryVector?, embedMS: Int) throws -> [String: Any] {
         switch op {
         case "search":
             let text = request["q"] as? String ?? ""
             let code = request["code"] as? Bool ?? false
             let kinds = (request["kinds"] as? [String]).map { Set($0.compactMap(FileKind.init(rawValue:))) }
             let limit = request["limit"] as? Int ?? 40
-            let wantMeaning = request["meaning"] as? Bool ?? true
             let prefixLast = request["prefix_last"] as? Bool ?? false
-            let started = Date()
-            var vector: [Float]?
-            var warning: String?
-            if wantMeaning, !text.isEmpty {
-                vector = self.vector(for: text, code: code)
-                // Vectors from another model or runtime must never meet: keyword-only then, and say so once.
-                if vector != nil, let indexed = (code ? codeSearcher : searcher)?.vectorSource,
-                   let source = encoder?.info.vectorSource, indexed != source {
-                    vector = nil
-                    if !warnedAboutSource {
-                        warning = "meaning search is off: the index was built with \(indexed), the encoder is \(source)"
-                        warnedAboutSource = true
-                    }
-                }
-            }
             let embedded = Date()
-            let hits: [SearchHit]
-            if code {
-                guard let codeSearcher else { return ["hits": [], "strong": 0, "meaning": false] }
-                hits = try codeSearcher.search(text, queryVector: vector, limit: limit, prefixLast: prefixLast).filter {
-                    FolderSelection.isSearched($0.path, folders: codeRoots, skipped: codeSkipped)
-                        && FileManager.default.fileExists(atPath: $0.path)
-                }
-            } else {
-                hits = try searcher.search(text, queryVector: vector, kinds: kinds, limit: limit, prefixLast: prefixLast)
-                    .filter {
-                        (roots.isEmpty || FolderSelection.isSearched($0.path, folders: roots, skipped: skipped))
-                            && !types.contains(($0.path as NSString).pathExtension.lowercased())
-                            && FileManager.default.fileExists(atPath: $0.path)
-                    }
+            let selected = code ? codeSearcher : searcher
+            let eligible: (String, FileKind) -> Bool = { [self] path, _ in
+                (code ? FolderSelection.isSearched(path, folders: searchedCodeRoots, skipped: searchedCodeSkipped)
+                    : FolderSelection.isSearched(path, folders: searchedRoots, skipped: searchedSkipped)
+                        && !types.contains((path as NSString).pathExtension.lowercased()))
             }
-            var reply: [String: Any] = [
-                "hits": hits.map(hitFields), "strong": Searcher.strongCount(hits), "meaning": vector != nil,
-                "ms": ["embed": Int(embedded.timeIntervalSince(started) * 1000),
+            let hits = try selected?.search(text, query: vector, kinds: kinds, limit: limit,
+                                             prefixLast: prefixLast, eligible: eligible,
+                                             available: { FileManager.default.fileExists(atPath: $0) }) ?? []
+            let meaning = selected?.lastQueryUsedMeaning ?? false
+            let reply: [String: Any] = [
+                "hits": hits.map(hitFields), "strong": Searcher.strongCount(hits), "meaning": meaning,
+                "ms": ["embed": embedMS,
                        "search": Int(Date().timeIntervalSince(embedded) * 1000)],
             ]
-            if let warning { reply["warning"] = warning }
             return reply
-        case "embed_ahead":
-            _ = vector(for: request["q"] as? String ?? "", code: request["code"] as? Bool ?? false)
-            return ["ok": true]
         case "text":
             guard let segment = (request["segment"] as? NSNumber)?.int64Value else { throw CLIError("which segment?") }
             let code = request["code"] as? Bool ?? false
             return ["text": try (code ? codeSearcher : searcher)?.text(ofSegment: segment) ?? NSNull()]
         case "reload":
-            let hadVectors = searcher.vectorsLoaded
-            searcher = try Searcher(store: store, loadVectors: hadVectors)
-            if let codeStore {
-                codeSearcher = try Searcher(store: codeStore, loadVectors: codeSearcher?.vectorsLoaded ?? false)
-            } else {
-                try openCode()
-            }
+            try searcher.refresh()
+            if let codeSearcher { try codeSearcher.refresh() } else { try openCode() }
             return ["ok": true, "vectors": searcher.vectorCount, "code_vectors": codeSearcher?.vectorCount ?? 0]
         case "summaries":
             let code = request["code"] as? Bool ?? false
@@ -192,6 +250,7 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
             if let value = request["types"] as? [String] { types = IndexOptions.extensions(value.joined(separator: ",")) }
             if let value = request["code_roots"] as? [String] { codeRoots = value.map { Arguments.folderURL($0).path } }
             if let value = request["code_skipped"] as? [String] { codeSkipped = value.map { Arguments.folderURL($0).path } }
+            updateScope()
             if codeRoots.isEmpty {
                 codeSearcher = nil
                 codeStore = nil
@@ -199,13 +258,8 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
                 try openCode()
             }
             return ["ok": true]
-        case "prewarm":
-            lastQuery = Date()
-            _ = runningEncoder()
-            if !searcher.vectorsLoaded { try searcher.reload() }
-            return ["ok": true, "encoder": encoderState, "vectors": searcher.vectorCount]
         case "status":
-            var reply: [String: Any] = ["encoder": encoderState, "vectors": searcher.vectorsLoaded ? searcher.vectorCount : 0,
+            var reply: [String: Any] = ["encoder": stateLock.withLock { encoderState }, "vectors": searcher.vectorsLoaded ? searcher.vectorCount : 0,
                                         "code_vectors": codeSearcher?.vectorsLoaded == true ? codeSearcher!.vectorCount : 0,
                                         "index": store.file.path]
             // What's in the index, as the index helper counts it: a shell knows it before any indexing runs.
@@ -278,16 +332,16 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
     // MARK: The query encoder
 
     /// The query's vector (cached), or nil when the encoder can't run: keyword results still work.
-    private func vector(for text: String, code: Bool) -> [Float]? {
-        lastQuery = Date()
+    private func vector(for text: String, code: Bool) -> Searcher.QueryVector? {
         let key = (code ? "code\u{0}" : "") + text
         if let cached = vectorCache[key] { return cached }
         guard let encoder = runningEncoder() else { return nil }
         do {
             let values = try encoder.embedTexts([code ? Prompts.codeQuery(text) : Prompts.query(text)]).first ?? []
             if vectorCache.count > 256 { vectorCache.removeAll() }
-            vectorCache[key] = values
-            return values
+            let vector = Searcher.QueryVector(values: values, source: encoder.info.vectorSource)
+            vectorCache[key] = vector
+            return vector
         } catch {
             FileHandle.standardError.write(Data("encoder: \(error)\n".utf8))
             stopEncoder()   // the next query starts a new one
@@ -297,18 +351,19 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
 
     private func runningEncoder() -> (any Embedder)? {
         if let encoder { return encoder }
-        guard encoderState != "unavailable" else { return nil }
-        encoderState = "starting"
+        guard Date() >= retryEncoderAt else { return nil }
+        stateLock.withLock { encoderState = "starting" }
         do {
             let started = Date()
             let worker = try makeEmbedder(textOnly: true, log: log, qos: .userInitiated)
             encoder = worker
-            encoderState = "ready"
+            stateLock.withLock { encoderState = "ready" }
             write(["event": "encoder", "state": "ready", "seconds": (Date().timeIntervalSince(started) * 100).rounded() / 100,
                   "source": worker.info.vectorSource])
             return worker
         } catch {
-            encoderState = "unavailable"
+            retryEncoderAt = Date().addingTimeInterval(5)
+            stateLock.withLock { encoderState = "unavailable" }
             write(["event": "encoder", "state": "unavailable", "error": String("\(error)".prefix(300))])
             return nil
         }
@@ -318,23 +373,29 @@ final class SearchService: @unchecked Sendable {   // its state is guarded by `l
         encoder?.close()
         encoder = nil
         vectorCache.removeAll()
-        if encoderState != "unavailable" { encoderState = "stopped" }
+        stateLock.withLock { encoderState = "stopped" }
     }
 
     /// After `idleSeconds` without a query the model and the vectors go (their memory back to the system).
     private func idleWatch() {
-        while true {
+        while !stateLock.withLock({ stopping }) {
             Thread.sleep(forTimeInterval: 1)
-            lock.withLock {
-                guard encoder != nil || searcher.vectorsLoaded, Date().timeIntervalSince(lastQuery) > idleSeconds
-                else { return }
+            guard stateLock.withLock({ Date().timeIntervalSince(lastQuery) > idleSeconds }) else { continue }
+            encoderQueue.async { [self] in
+                guard stateLock.withLock({ !stopping && Date().timeIntervalSince(lastQuery) > idleSeconds }) else { return }
+                let hadEncoder = encoder != nil
                 stopEncoder()
-                searcher.releaseVectors()
-                codeSearcher?.releaseVectors()
-                write(["event": "encoder", "state": "stopped", "reason": "idle"])
+                searchQueue.async { [self] in
+                    guard stateLock.withLock({ !stopping && Date().timeIntervalSince(lastQuery) > idleSeconds }),
+                          hadEncoder || searcher.vectorsLoaded || codeSearcher?.vectorsLoaded == true else { return }
+                    searcher.releaseVectors()
+                    codeSearcher?.releaseVectors()
+                    write(["event": "encoder", "state": "stopped", "reason": "idle"])
+                }
             }
         }
     }
+
 }
 
 /// A value handed to another thread that only that thread uses from then on.

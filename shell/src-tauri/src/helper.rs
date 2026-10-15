@@ -108,7 +108,9 @@ fn reap(child: &mut Child) -> Option<i32> {
             Err(_) => return None,
         }
     }
-    None
+    // EOF is terminal for this protocol. A helper that closed stdout but stayed alive must not escape supervision.
+    let _ = child.kill();
+    child.wait().ok().and_then(|status| status.code())
 }
 
 /// `digup search-service`: started on the first request, and again after it died.
@@ -117,6 +119,8 @@ pub struct SearchService {
     running: Arc<Mutex<Option<Searching>>>,
     next_id: AtomicU64,
     on_event: EventSink,
+    configuration: Mutex<Option<Value>>,
+    configuring: Mutex<()>,
 }
 
 struct Searching {
@@ -134,7 +138,20 @@ impl SearchService {
             running: Arc::default(),
             next_id: AtomicU64::new(1),
             on_event: Arc::new(on_event),
+            configuration: Mutex::new(None),
+            configuring: Mutex::new(()),
         }
+    }
+
+    /// Save live configuration before sending it; each replacement helper receives it before serving requests.
+    pub fn configure(&self, request: Value) -> Result<(), String> {
+        let _serial = self.configuring.lock().unwrap();
+        *self.configuration.lock().unwrap() = Some(request.clone());
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut request = request;
+        request["id"] = json!(id);
+        let _ = self.send(id, &request)?;
+        Ok(())
     }
 
     /// Sends a request and waits for its reply.
@@ -171,14 +188,24 @@ impl SearchService {
     }
 
     fn start(&self) -> Result<Searching, String> {
-        let (child, stdin, stdout) = self.launch.spawn()?;
+        let (mut child, mut stdin, stdout) = self.launch.spawn()?;
+        if let Some(mut request) = self.configuration.lock().unwrap().clone() {
+            request["id"] = json!(0);
+            if let Err(error) = writeln!(stdin, "{request}").and_then(|_| stdin.flush()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("can't restore helper configuration: {error}"));
+            }
+        }
         let number = STARTED.fetch_add(1, Ordering::Relaxed);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::default();
         let (replies, on_event, slot) = (pending.clone(), self.on_event.clone(), self.running.clone());
         std::thread::spawn(move || {
+            on_event(json!({"event": "generation", "generation": number}));
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(mut message) = serde_json::from_str::<Value>(&line) else { continue };
+                if message.get("id").is_none() { message["generation"] = json!(number); }
                 match message.get("id").and_then(Value::as_u64) {
                     Some(id) => {
                         if let Some(sender) = replies.lock().unwrap().remove(&id) {
@@ -197,7 +224,7 @@ impl SearchService {
                 }
             }
             drop(slot);
-            on_event(json!({"event": "exit"}));
+            on_event(json!({"event": "exit", "generation": number}));
         });
         Ok(Searching { child, stdin, number, pending })
     }
@@ -216,6 +243,7 @@ impl SearchService {
 pub struct IndexService {
     running: Arc<Mutex<Option<Indexing>>>,
     on_event: EventSink,
+    next_sync: AtomicU64,
 }
 
 struct Indexing {
@@ -224,20 +252,35 @@ struct Indexing {
     args: Vec<String>,
     number: u64,
     /// Asked to sync, and it hasn't started that sync yet: owed if it exits first (it was leaving as it was asked).
-    owed: bool,
+    sync: SyncRequests,
+}
+
+#[derive(Default)]
+struct SyncRequests {
+    requested: [u64; 2],
+    acknowledged: [u64; 2],
+}
+
+impl SyncRequests {
+    fn request(&mut self, part: usize, generation: u64) { self.requested[part] = generation; }
+    fn acknowledge(&mut self, part: usize, generation: u64) {
+        self.acknowledged[part] = self.acknowledged[part].max(generation);
+    }
+    fn owed(&self) -> bool { (0..2).any(|part| self.requested[part] > self.acknowledged[part]) }
 }
 
 impl IndexService {
     pub fn new(on_event: impl Fn(Value) + Send + Sync + 'static) -> IndexService {
-        IndexService { running: Arc::default(), on_event: Arc::new(on_event) }
+        IndexService { running: Arc::default(), on_event: Arc::new(on_event), next_sync: AtomicU64::new(1) }
     }
 
     pub fn run(&self, launch: &Launch) -> Result<(), String> {
         let mut running = self.running.lock().unwrap();
         if let Some(indexing) = running.as_mut() {
             if matches!(indexing.child.try_wait(), Ok(None)) && indexing.args == launch.args {
-                indexing.owed = true;
-                return writeln!(indexing.stdin, "sync").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string());
+                let generation = self.next_sync.fetch_add(1, Ordering::Relaxed);
+                indexing.sync.request(0, generation);
+                return writeln!(indexing.stdin, "sync {generation}").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string());
             }
         }
         // Gone, or other folders: (stop it and) start anew.
@@ -251,9 +294,12 @@ impl IndexService {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
-                if event["event"] == "sync" {
+                if event["event"] == "sync_started" {
                     if let Some(indexing) = slot.lock().unwrap().as_mut().filter(|indexing| indexing.number == number) {
-                        indexing.owed = false;
+                        let part = usize::from(event["code"] == true);
+                        if let Some(generation) = event["generation"].as_u64() {
+                            indexing.sync.acknowledge(part, generation);
+                        }
                     }
                 }
                 on_event(event);
@@ -263,11 +309,12 @@ impl IndexService {
                 if let Some(mut indexing) = slot.take() {
                     drop(slot);
                     let status = reap(&mut indexing.child);
-                    on_event(json!({"event": "ended", "status": status, "owed": indexing.owed}));
+                    let owed = indexing.sync.owed();
+                    on_event(json!({"event": "ended", "status": status, "owed": owed}));
                 }
             }
         });
-        *running = Some(Indexing { child, stdin, args: launch.args.clone(), number, owed: false });
+        *running = Some(Indexing { child, stdin, args: launch.args.clone(), number, sync: SyncRequests::default() });
         Ok(())
     }
 
@@ -278,7 +325,9 @@ impl IndexService {
             let mut running = self.running.lock().unwrap();
             if let Some(indexing) = running.as_mut() {
                 if matches!(indexing.child.try_wait(), Ok(None)) && indexing.args == launch.args {
-                    return writeln!(indexing.stdin, "sync code").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string());
+                    let generation = self.next_sync.fetch_add(1, Ordering::Relaxed);
+                    indexing.sync.request(1, generation);
+                    return writeln!(indexing.stdin, "sync code {generation}").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string());
                 }
             }
         }
@@ -405,5 +454,62 @@ mod job {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SyncRequests;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_that_stays_alive_after_eof_is_killed_and_reaped() {
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", "import time; time.sleep(30)"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        super::reap(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_search_helpers_receive_current_configuration() {
+        use super::{Launch, SearchService};
+        use serde_json::json;
+        let script = r#"import json,sys
+config = {"roots": ["startup"]}
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("op") == "quit": break
+    if request.get("op") == "folders": config = request
+    print(json.dumps({"id": request["id"], "ok": True, "roots": config["roots"]}), flush=True)
+"#;
+        let service = SearchService::new(Launch {
+            program: "python3".into(), args: vec!["-u".into(), "-c".into(), script.into()],
+            env: vec![], log: None, background: false,
+        }, |_| {});
+        service.configure(json!({"op": "folders", "roots": ["current"]})).unwrap();
+        let first = tauri::async_runtime::block_on(service.ask(json!({"op": "get"}))).unwrap();
+        assert_eq!(first["roots"], json!(["current"]));
+        service.stop();
+        let replacement = tauri::async_runtime::block_on(service.ask(json!({"op": "get"}))).unwrap();
+        assert_eq!(replacement["roots"], json!(["current"]));
+        service.stop();
+    }
+
+    #[test]
+    fn sync_acknowledgements_are_per_index_and_generation() {
+        let mut sync = SyncRequests::default();
+        sync.request(0, 3);
+        sync.request(1, 4);
+        sync.acknowledge(0, 3);
+        assert!(sync.owed(), "a main-index crawl cannot acknowledge code work");
+        sync.acknowledge(1, 2);
+        assert!(sync.owed(), "an old crawl cannot acknowledge a newer request");
+        sync.acknowledge(1, 4);
+        assert!(!sync.owed());
+        sync.request(1, 5);
+        assert!(sync.owed(), "a code sync arriving as the helper exits must restart it");
     }
 }

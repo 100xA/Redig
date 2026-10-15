@@ -5,10 +5,12 @@ module CLlama [system] {
     header "../../Vendor/llama/include/mtmd.h"
     header "../../Vendor/llama/include/mtmd-helper.h"
     header "../../Vendor/llama/include/llama-build.h"
+    header "cpu-loader.h"
     link "llama"
     link "mtmd"
     link "ggml"
     link "ggml-base"
     link "stdc++"
+    link "dl"
     export *
 }
