@@ -113,7 +113,7 @@ public final class OrganizerMoveJournal {
         let id = db.lastInsertID
         do {
             let moved = try coordinatedMove(from: paths.source, to: paths.destination) { from, to in
-                guard from.standardizedFileURL == paths.source, to.standardizedFileURL == paths.destination else {
+                guard self.canonicalFile(from) == paths.source, self.canonicalFile(to) == paths.destination else {
                     throw self.failure("A file location changed while preparing the move. Refresh and try again.")
                 }
                 _ = try self.validatedPaths(source: from, destination: to, allowedRoots: allowedRoots)
@@ -144,7 +144,7 @@ public final class OrganizerMoveJournal {
                    [.double(Date().timeIntervalSince1970), .int(id)])
         do {
             _ = try coordinatedMove(from: paths.source, to: paths.destination) { from, to in
-                guard from.standardizedFileURL == paths.source, to.standardizedFileURL == paths.destination else {
+                guard self.canonicalFile(from) == paths.source, self.canonicalFile(to) == paths.destination else {
                     throw self.failure("A file location changed while preparing undo. Refresh and try again.")
                 }
                 _ = try self.validatedPaths(source: from, destination: to, allowedRoots: allowedRoots)
@@ -240,7 +240,7 @@ public final class OrganizerMoveJournal {
         guard from != to else { throw failure("The source and destination are the same file.") }
         let roots = try allowedRoots.map { root -> URL in
             guard root.isFileURL else { throw failure("Organizer folders must be local folders.") }
-            let canonical = root.standardizedFileURL.resolvingSymlinksInPath()
+            let canonical = URL(fileURLWithPath: FolderSelection.realPath(root.path))
             let values = try canonical.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
             guard values.isDirectory == true, values.isPackage != true, !FileSystem.isPackage(canonical, values) else { throw failure("An organizer folder is unavailable or is a bundle.") }
             return canonical
@@ -260,7 +260,7 @@ public final class OrganizerMoveJournal {
         try fm.createDirectory(at: parent, withIntermediateDirectories: true)
         // Recheck after creation; an existing parent may have been replaced by a symlink while coordinating.
         guard canonicalFile(destination) == destination else { throw failure("The destination folder changed during the move.") }
-        let roots = allowedRoots.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+        let roots = allowedRoots.map { URL(fileURLWithPath: FolderSelection.realPath($0.path)) }
         guard let root = roots.first(where: { contains(destination, in: $0) }) else {
             throw failure("The destination is outside the selected organizer folders.")
         }
@@ -282,9 +282,18 @@ public final class OrganizerMoveJournal {
     }
 
     private func canonicalFile(_ url: URL) -> URL {
-        let normalized = url.standardizedFileURL
-        return normalized.deletingLastPathComponent().resolvingSymlinksInPath()
-            .appendingPathComponent(normalized.lastPathComponent)
+        // Foundation resolves existing /var aliases, but can drop /private when the destination's parents do
+        // not exist yet. Resolve the nearest existing ancestor with realpath, then append the untouched tail.
+        // Ancestor symlinks below a selected root were already rejected before this canonicalization.
+        var ancestor = url.standardizedFileURL
+        var tail: [String] = []
+        while !fm.fileExists(atPath: ancestor.path), ancestor.path != "/" {
+            tail.append(ancestor.lastPathComponent)
+            ancestor.deleteLastPathComponent()
+        }
+        let base = FolderSelection.realPath(ancestor.path)
+        let path = tail.isEmpty ? base : (base == "/" ? "" : base) + "/" + tail.reversed().joined(separator: "/")
+        return URL(fileURLWithPath: path)
     }
 
     private func contains(_ item: URL, in root: URL) -> Bool {

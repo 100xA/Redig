@@ -63,7 +63,7 @@ import Testing
         }
     }
 
-    @Test func semanticCollectionsAreDeterministicVirtualAndStable() throws {
+    @Test func strongSemanticCollectionsAreDeterministicAndRetainFilingEligibility() throws {
         try withStores { index, organizer, root in
             let first = try add(index, root, "Mars research overview.md", values: vector(0))
             try add(index, root, "Mars mission budget.pdf", values: vector(0), kind: .pdf)
@@ -73,7 +73,7 @@ import Testing
             #expect(project.memberCount == 2)
             #expect(!project.isExistingFolder)
             #expect(project.destinationPath.contains("/Redig Organized/"))
-            #expect(before.assignments.allSatisfy { !$0.canMoveAutomatically })
+            #expect(before.assignments.allSatisfy { $0.canMoveAutomatically })
             #expect(before.reviewItems.count == 1)
             try organizer.rename(projectID: project.id, name: "Mars Mission")
             try add(index, root, "a-new-brief.txt", values: vector(0))
@@ -81,7 +81,7 @@ import Testing
             #expect(after.projects.first { $0.id == project.id }?.name == "Mars Mission")
             #expect(after.projects.first { $0.id == project.id }?.memberCount == 3)
             #expect(after.assignments.first { $0.fileID == first }?.projectID == project.id)
-            #expect(after.assignments.allSatisfy { !$0.canMoveAutomatically })
+            #expect(after.assignments.allSatisfy { $0.canMoveAutomatically })
         }
     }
 
@@ -383,6 +383,71 @@ import Testing
             #expect(rebuilt.assignments.first { $0.fileID == loose }?.reason == .manual)
             #expect(rebuilt.assignments.first { $0.fileID == loose }?.projectID == atlas.id)
             #expect(rebuilt.assignments.allSatisfy { $0.inode > 0 && $0.device == 1 })
+        }
+    }
+
+    @Test func generatedProjectSurvivesPartialRepathingIncomingFilesAndUndo() throws {
+        try withStores { index, organizer, root in
+            let a = try add(index, root, "Mars research.md", values: vector(0))
+            let b = try add(index, root, "Mars budget.md", values: vector(0))
+            let before = try organizer.refresh(index: index, roots: [root])
+            let project = try #require(before.projects.first)
+            #expect(before.assignments.allSatisfy { $0.canMoveAutomatically })
+            // The watcher can commit one re-path before observing the next move in the same batch.
+            try index.move(a, to: project.destinationPath + "/Mars research.md")
+            let partial = try organizer.refresh(index: index, roots: [root])
+            #expect(partial.projects.count == 1)
+            #expect(partial.projects.first?.id == project.id)
+            #expect(partial.assignments.first { $0.fileID == b }?.canMoveAutomatically == true)
+            try index.move(b, to: project.destinationPath + "/Mars budget.md")
+            _ = try organizer.refresh(index: index, roots: [root])
+            let incoming = try add(index, root, "new-attachment.pdf", values: vector(0), kind: .pdf)
+            let next = try organizer.refresh(index: index, roots: [root])
+            #expect(next.assignments.first { $0.fileID == incoming }?.projectID == project.id)
+            #expect(next.assignments.first { $0.fileID == incoming }?.canMoveAutomatically == true)
+            // Undo can return both original members before the next index commit. Keep the same proposed folder.
+            try index.move(a, to: root.appendingPathComponent("Mars research.md").path)
+            try index.move(b, to: root.appendingPathComponent("Mars budget.md").path)
+            let undone = try organizer.refresh(index: index, roots: [root])
+            #expect(undone.projects.count == 1)
+            #expect(undone.projects.first?.id == project.id)
+            #expect(undone.projects.first?.destinationPath == project.destinationPath)
+            #expect(undone.assignments.allSatisfy { $0.canMoveAutomatically })
+        }
+    }
+
+    @Test func incompleteAmbiguousWeakAndSingletonContentCannotCreateAutomaticFolders() throws {
+        try withStores { index, organizer, root in
+            try add(index, root, "partial-first.pdf", values: vector(0), state: "partial", kind: .pdf)
+            try add(index, root, "complete-second.pdf", values: vector(0), kind: .pdf)
+            var snapshot = try organizer.refresh(index: index, roots: [root])
+            #expect(snapshot.assignments.count == 2)
+            #expect(snapshot.assignments.allSatisfy { !$0.canMoveAutomatically })
+            try add(index, root, "another-complete.pdf", values: vector(0), kind: .pdf)
+            snapshot = try organizer.refresh(index: index, roots: [root])
+            #expect(snapshot.assignments.filter { $0.canMoveAutomatically }.count == 2)
+            #expect(snapshot.assignments.first { $0.path.hasSuffix("partial-first.pdf") }?.canMoveAutomatically == false)
+        }
+        try withStores { index, organizer, root in
+            try add(index, root, "Atlas/one.md", values: vector(0))
+            try add(index, root, "Atlas/two.md", values: vector(0))
+            try add(index, root, "Borealis/one.md", values: vector(0))
+            try add(index, root, "Borealis/two.md", values: vector(0))
+            try add(index, root, "loose-one.md", values: vector(0))
+            try add(index, root, "loose-two.md", values: vector(0))
+            try add(index, root, "singleton.md", values: vector(1))
+            let snapshot = try organizer.refresh(index: index, roots: [root])
+            #expect(snapshot.projects.allSatisfy { $0.isExistingFolder })
+            #expect(snapshot.assignments.allSatisfy { !$0.canMoveAutomatically })
+            #expect(snapshot.reviewItems.count == 3)
+        }
+        try withStores { index, organizer, root in
+            try add(index, root, "weak-one.md", values: vector(0))
+            // Cosine is about .894: a very high pooled-centroid score cannot override weak pair coherence.
+            try add(index, root, "weak-two.md", values: vector(0, (1, 0.5)))
+            let snapshot = try organizer.refresh(index: index, roots: [root])
+            #expect(snapshot.projects.isEmpty)
+            #expect(snapshot.reviewItems.count == 2)
         }
     }
 

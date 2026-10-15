@@ -63,7 +63,7 @@ public final class OrganizerProjectStore {
     private static let matchThreshold = 0.86
     private static let moveThreshold = 0.90
     private static let ambiguityMargin = 0.08
-    private static let cacheVersion = "projects-v3"
+    private static let cacheVersion = "projects-v4"
     private static let maximumClusterCandidates = 256
 
     public init(directory: URL) throws {
@@ -300,14 +300,25 @@ public final class OrganizerProjectStore {
             if groups[project.id] == nil { groups[project.id] = Group(project: project, members: [], center: nil, terms: Self.terms(project.name)) }
             add(n, to: project.id, reason: .manual, score: 1)
         }
-        // Keep coherent automatic collections stable as new files arrive; model changes never reuse old centroids.
+        // Keep generated projects stable while indexing observes a move in stages. Some members may already
+        // be inside the destination while others still have their loose indexed paths. Undo can make every member
+        // loose again; generated IDs and the destination must survive that transition as well.
         if sourceUnchanged {
             let previousIDs = Dictionary(uniqueKeysWithValues: previous.assignments.map { ($0.fileID, $0.projectID) })
-            for prior in previous.projects where !prior.isExistingFolder && groups[prior.id] == nil {
+            for prior in previous.projects where prior.id.hasPrefix("project-") {
                 let members = files.indices.filter { assigned[$0] == nil && previousIDs[files[$0].record.id] == prior.id }
-                guard members.count >= 2, let center = Self.center(members.compactMap { files[$0].vector }),
-                      members.allSatisfy({ files[$0].vector.map { Self.dot($0, center) >= Self.matchThreshold } ?? false }) else { continue }
-                groups[prior.id] = Group(project: prior, members: [], center: center, terms: Self.terms(prior.name))
+                let seeds = groups[prior.id]?.members ?? []
+                let all = seeds + members
+                guard !members.isEmpty, all.count >= 2,
+                      let center = Self.center(all.compactMap { files[$0].vector }),
+                      all.allSatisfy({ files[$0].vector.map { Self.dot($0, center) >= Self.matchThreshold } ?? false }) else { continue }
+                if groups[prior.id] == nil {
+                    // No currently indexed members are in this folder, so first creation still needs the app policy.
+                    let project = OrganizerProject(id: prior.id, name: prior.name, memberCount: prior.memberCount,
+                                               rootPath: prior.rootPath, destinationPath: prior.destinationPath,
+                                               isExistingFolder: false, isUserNamed: prior.isUserNamed)
+                    groups[prior.id] = Group(project: project, members: [], center: center, terms: Self.terms(prior.name))
+                }
                 for n in members { add(n, to: prior.id, reason: .semantic, score: Self.dot(files[n].vector!, center)) }
             }
         }
@@ -317,7 +328,9 @@ public final class OrganizerProjectStore {
             group.terms.formUnion(group.members.reduce(into: Set<String>()) { $0.formUnion(files[$1].tokens) })
             groups[id] = group
         }
-        let seedSupport = groups.mapValues { group in group.members.filter { files[$0].vector != nil }.count }
+        var seedSupport = groups.mapValues { group in
+            group.members.filter { files[$0].vector != nil && files[$0].record.state == "done" }.count
+        }
         var reviews: [Int: OrganizerReviewItem] = [:]
         // Compare loose files against frozen seed centroids, so assignment order cannot create a semantic snowball.
         for n in files.indices where assigned[n] == nil {
@@ -331,8 +344,7 @@ public final class OrganizerProjectStore {
             if best.1 >= Self.matchThreshold && margin >= Self.ambiguityMargin {
                 let supporting = seedSupport[best.0] ?? 0
                 add(n, to: best.0, reason: .semantic, score: best.1,
-                    automatic: best.1 >= Self.moveThreshold && supporting >= 2 && groups[best.0]!.project.isExistingFolder
-                        && files[n].record.state == "done")
+                    automatic: best.1 >= Self.moveThreshold && supporting >= 2 && files[n].record.state == "done")
             } else if best.1 >= 0.65 {
                 reviews[n] = OrganizerReviewItem(path: files[n].record.path, fileID: files[n].record.id,
                                                  suggestedProjectID: best.0, score: best.1,
@@ -341,7 +353,7 @@ public final class OrganizerProjectStore {
         }
         // Deterministic bounded leader clustering for new loose files. Every member must match the fixed anchor and
         // final centroid; unlike single-link clustering a chain of distant topics cannot collapse into one project.
-        let remaining = files.indices.filter { assigned[$0] == nil && files[$0].vector != nil }
+        let remaining = files.indices.filter { assigned[$0] == nil && reviews[$0] == nil && files[$0].vector != nil }
         var available = Set(remaining)
         var bins: [String: [Int]] = [:], signatures: [Int: [UInt16]] = [:]
         for n in remaining {
@@ -384,7 +396,7 @@ public final class OrganizerProjectStore {
             let name = Self.projectName(members.map { files[$0].tokens })
             var priorCounts: [String: Int] = [:]
             for n in members {
-                if let id = previousProjectByFile[files[n].record.id], oldProjects[id]?.isExistingFolder == false {
+                if let id = previousProjectByFile[files[n].record.id], id.hasPrefix("project-") {
                     priorCounts[id, default: 0] += 1
                 }
             }
@@ -400,11 +412,27 @@ public final class OrganizerProjectStore {
                                            destinationPath: prior?.destinationPath ?? destination, isExistingFolder: false,
                                            isUserNamed: prior?.isUserNamed ?? false)
             groups[id] = Group(project: project, members: [], center: center, terms: Self.terms(display))
-            for n in members {
-                reviews.removeValue(forKey: n)
-                // New collections remain virtual until the user approves a destination; their names are metadata.
-                add(n, to: id, reason: .semantic, score: Self.dot(files[n].vector!, center))
+            seedSupport[id] = members.filter { files[$0].record.state == "done" }.count
+            for n in members { add(n, to: id, reason: .semantic, score: Self.dot(files[n].vector!, center)) }
+        }
+        for id in groups.keys where id.hasPrefix("project-") {
+            seedSupport[id] = groups[id]!.members.filter { files[$0].record.state == "done" && files[$0].vector != nil }.count
+        }
+        // Every physical filing recommendation is checked against all final project centroids. A newly discovered
+        // competing group can invalidate a previously strong match; partial content and filename heuristics stay virtual.
+        for n in assigned.keys.sorted() {
+            guard let current = assigned[n], current.reason == .semantic, let vector = files[n].vector,
+                  let group = groups[current.projectID], let center = group.center else { continue }
+            let score = Self.dot(vector, center)
+            let competitor = groups.values.filter { $0.project.id != current.projectID }
+                .compactMap { $0.center.map { Self.dot(vector, $0) } }.max() ?? -1
+            let coherentPeer = !current.projectID.hasPrefix("project-") || group.members.contains { peer in
+                peer != n && files[peer].record.state == "done"
+                    && files[peer].vector.map { Self.dot(vector, $0) >= Self.moveThreshold } == true
             }
+            let automatic = files[n].record.state == "done" && (seedSupport[current.projectID] ?? 0) >= 2
+                && coherentPeer && score >= Self.moveThreshold && score - competitor >= Self.ambiguityMargin
+            assigned[n] = assignment(n, current.projectID, .semantic, score, automatic)
         }
         // Filename overlap is deliberately labelled and never authorizes a physical move.
         for n in files.indices where assigned[n] == nil && reviews[n] == nil {

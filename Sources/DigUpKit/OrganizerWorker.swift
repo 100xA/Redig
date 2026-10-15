@@ -7,15 +7,17 @@ public struct OrganizerConfiguration: Sendable {
     public let excludedTypes: Set<String>
     public let enabled: Bool
     public let automatic: Bool
+    public let createProjectFolders: Bool
     public let revision: UInt64
 
     public init(roots: [URL], excluded: [URL] = [], excludedTypes: Set<String> = [],
-                enabled: Bool = true, automatic: Bool = false, revision: UInt64) {
+                enabled: Bool = true, automatic: Bool = false, createProjectFolders: Bool = true, revision: UInt64) {
         self.roots = roots.map { URL(fileURLWithPath: Self.canonicalPath($0)) }
         self.excluded = excluded.map { URL(fileURLWithPath: Self.canonicalPath($0)) }
         self.excludedTypes = Set(excludedTypes.map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() })
         self.enabled = enabled && !roots.isEmpty
         self.automatic = automatic && self.enabled
+        self.createProjectFolders = createProjectFolders
         self.revision = revision
     }
 
@@ -43,13 +45,15 @@ public struct OrganizerConfiguration: Sendable {
 /// Connections and operations are confined to the caller's one serial queue; only invalidate/revision are thread-safe.
 public final class OrganizerWorker: @unchecked Sendable {
     public enum Action: Sendable {
-        case refresh, move(OrganizerAssignment), undo(Int64), rename(String, String), assign(String, String)
+        case refresh, preview, sort, move(OrganizerAssignment), fileProject(String), undo(Int64), undoLatest, rename(String, String), assign(String, String)
         case history(Int)
     }
     public struct Output: Sendable {
         public let snapshot: OrganizerProjectSnapshot
         public let history: [OrganizerMoveJournal.MoveRecord]
         public let moved: Bool
+        public let movedCount: Int
+        public let message: String?
         public let problem: String?
         public let historyOffset: Int
         public let hasOlderHistory: Bool
@@ -72,17 +76,22 @@ public final class OrganizerWorker: @unchecked Sendable {
         if projects == nil { projects = try OrganizerProjectStore(directory: storage) }
         if journal == nil { journal = try OrganizerMoveJournal(directory: storage) }
         guard let projects, let journal else { preconditionFailure("Organizer storage did not open") }
-        var moved = false
+        var movedCount = 0
+        var message: String?
         var problem: String?
         guard revision == config.revision else {
-            return Output(snapshot: .empty, history: [], moved: false, problem: nil,
+            return Output(snapshot: .empty, history: [], moved: false, movedCount: 0, message: nil, problem: nil,
                           historyOffset: historyOffset, hasOlderHistory: false)
         }
         switch action {
-        case .refresh: break
+        case .refresh, .preview: break
+        case .sort:
+            guard config.enabled else { throw OrganizerMoveJournal.Failure(message: "Enable this folder in Organizer first.") }
+        case .fileProject:
+            guard config.enabled else { throw OrganizerMoveJournal.Failure(message: "Enable this folder in Organizer first.") }
         case .history(let offset):
             historyOffset = max(0, offset)
-            return try output(snapshot: projects.snapshot(), journal: journal, moved: false, problem: nil)
+            return try output(snapshot: projects.snapshot(), journal: journal, movedCount: 0, message: nil, problem: nil)
         case .move(let assignment):
             guard config.enabled else { throw OrganizerMoveJournal.Failure(message: "Enable this folder in Organizer first.") }
             let snapshot = try projects.snapshot()
@@ -91,10 +100,20 @@ public final class OrganizerWorker: @unchecked Sendable {
                 throw OrganizerMoveJournal.Failure(message: "This project changed. Refresh and try again.")
             }
             try move(assignment, into: project, journal: journal, config: config)
-            moved = true
+            movedCount += 1
         case .undo(let id):
             try journal.undo(id: id, allowedRoots: config.roots)
-            moved = true
+            movedCount += 1
+        case .undoLatest:
+            var latest: Int64?
+            try journal.db.query("SELECT id FROM organizer_moves WHERE state = 'moved' ORDER BY updated_at DESC, id DESC LIMIT 1") {
+                latest = $0.int(0)
+            }
+            if let latest {
+                try journal.undo(id: latest, allowedRoots: config.roots)
+                movedCount += 1
+                message = "Undid the latest file move."
+            } else { message = "There are no file moves to undo." }
         case .rename(let id, let name): try projects.rename(projectID: id, name: name)
         case .assign(let path, let id): try projects.assign(filePath: path, to: id)
         }
@@ -114,7 +133,57 @@ public final class OrganizerWorker: @unchecked Sendable {
                 problem = error.localizedDescription
             }
         }
-        if groupingReady, config.automatic, case .refresh = action {
+        if groupingReady, case .fileProject(let id) = action {
+            guard let project = snapshot.projects.first(where: { $0.id == id }) else {
+                throw OrganizerMoveJournal.Failure(message: "This project changed. Refresh and try again.")
+            }
+            let destination = URL(fileURLWithPath: project.destinationPath, isDirectory: true)
+            let candidates = snapshot.assignments.filter {
+                $0.projectID == id && !OrganizerConfiguration.contains(destination, URL(fileURLWithPath: $0.path))
+                    && FileManager.default.fileExists(atPath: $0.path)
+            }
+            var failures = 0, attempts = 0
+            var hasRemaining = false
+            for file in candidates {
+                guard revision == config.revision else { break }
+                let target = destination.appendingPathComponent(URL(fileURLWithPath: file.path).lastPathComponent)
+                // Reviewable conflicts must not consume every slot when the command is repeated. The journal
+                // still rechecks the destination and exact source identity immediately before every actual move.
+                if FileManager.default.fileExists(atPath: target.path)
+                    || (try? FileManager.default.attributesOfItem(atPath: target.path)) != nil {
+                    failures += 1
+                    problem = "A file already exists at \(target.path)."
+                    continue
+                }
+                guard let current = FileSystem.info(of: file.path), current.isRegular, !current.dataless,
+                      current.size == file.size, current.mtime == file.modified,
+                      current.inode == file.inode, current.device == file.device else {
+                    failures += 1
+                    problem = "A file changed since indexing or is not fully downloaded. Refresh before filing it."
+                    continue
+                }
+                guard attempts < 10 else { hasRemaining = true; continue }
+                attempts += 1
+                do {
+                    try move(file, into: project, journal: journal, config: config)
+                    movedCount += 1
+                } catch {
+                    failures += 1
+                    problem = error.localizedDescription
+                }
+            }
+            let noun = movedCount == 1 ? "file" : "files"
+            message = movedCount == 0 ? "No files were filed into \(project.name)." : "Filed \(movedCount) \(noun) into \(project.name)."
+            if hasRemaining { message! += " Run the command again for the remaining files." }
+            if failures > 0 { message! += " \(failures) \(failures == 1 ? "file needs" : "files need") review." }
+        }
+        let shouldFile: Bool
+        switch action {
+        case .refresh: shouldFile = config.automatic
+        case .sort: shouldFile = config.enabled
+        default: shouldFile = false
+        }
+        if groupingReady, shouldFile {
             let suppressed = Set(try journal.automaticallySuppressedPaths().map {
                 OrganizerConfiguration.canonicalPath(URL(fileURLWithPath: $0))
             })
@@ -131,7 +200,9 @@ public final class OrganizerWorker: @unchecked Sendable {
             var attempts = 0
             for file in candidates {
                 guard revision == config.revision, attempts < 10 else { break }
-                guard let project = projectsByID[file.projectID] else { continue }
+                guard let project = projectsByID[file.projectID],
+                      project.isExistingFolder || config.createProjectFolders,
+                      FileManager.default.fileExists(atPath: file.path) else { continue }
                 let target = URL(fileURLWithPath: project.destinationPath).appendingPathComponent(URL(fileURLWithPath: file.path).lastPathComponent)
                 // A collision stays for review; do not create a new failed journal record every timer tick.
                 if FileManager.default.fileExists(atPath: target.path)
@@ -139,20 +210,24 @@ public final class OrganizerWorker: @unchecked Sendable {
                 attempts += 1
                 do {
                     try move(file, into: project, journal: journal, config: config)
-                    moved = true
+                    movedCount += 1
                 } catch {
                     problem = error.localizedDescription
                 }
             }
         }
-        if moved { historyOffset = 0 }
-        return try output(snapshot: snapshot, journal: journal, moved: moved, problem: problem)
+        if case .sort = action {
+            message = movedCount == 0 ? "No stable, confident files are ready to sort yet." : "Sorted \(movedCount) \(movedCount == 1 ? "file" : "files")."
+            if !groupingReady { message = "The index is not ready to sort yet." }
+        }
+        if movedCount > 0 { historyOffset = 0 }
+        return try output(snapshot: snapshot, journal: journal, movedCount: movedCount, message: message, problem: problem)
     }
 
     private func output(snapshot: OrganizerProjectSnapshot, journal: OrganizerMoveJournal,
-                        moved: Bool, problem: String?) throws -> Output {
+                        movedCount: Int, message: String?, problem: String?) throws -> Output {
         let page = try journal.history(limit: 51, offset: historyOffset)
-        return Output(snapshot: snapshot, history: Array(page.prefix(50)), moved: moved, problem: problem,
+        return Output(snapshot: snapshot, history: Array(page.prefix(50)), moved: movedCount > 0, movedCount: movedCount, message: message, problem: problem,
                       historyOffset: historyOffset, hasOlderHistory: page.count > 50)
     }
 

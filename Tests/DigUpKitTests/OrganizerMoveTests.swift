@@ -42,7 +42,23 @@ import Testing
         #expect(try contents(source) == "Project research notes")
         #expect(!exists(destination))
         #expect(throws: OrganizerMoveJournal.Failure.self) { try reopened.undo(id: record.id, allowedRoots: allowed) }
-        #expect(try journal().automaticallySuppressedPaths() == [source.resolvingSymlinksInPath().path])
+        #expect(try journal().automaticallySuppressedPaths() == [FolderSelection.realPath(source.path)])
+    }
+
+    @Test func newNestedParentsKeepTheSameCanonicalRootSpelling() throws {
+        let source = try make()
+        let selected = [files, other].map { URL(fileURLWithPath: FolderSelection.realPath($0.path)) }
+        let destination = selected[1].appendingPathComponent("Redig Organized/New Project/notes.txt")
+        let journal = try journal()
+        let record = try journal.move(source: source, to: destination, allowedRoots: selected)
+        #expect(record.source.path == FolderSelection.realPath(source.deletingLastPathComponent().path) + "/notes.txt")
+        #expect(record.destination.path == destination.path)
+        #expect(try contents(destination) == "Project research notes")
+        #expect(!exists(source))
+        let undo = try journal.undo(id: record.id, allowedRoots: selected)
+        #expect(undo.state == .undone)
+        #expect(try contents(source) == "Project research notes")
+        #expect(!exists(destination))
     }
 
     @Test func historyPagesRemainStableAndDoNotOverlap() throws {
