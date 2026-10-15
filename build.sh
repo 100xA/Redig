@@ -29,7 +29,7 @@ swift build -c release --product DigUpApp
 swift build -c release --product digup
 BIN_DIR="$(swift build -c release --show-bin-path)"
 
-# The app icon ("One space", moss; Resources/AppIcon/README.md): macOS 26 draws the layered AppIcon.icon (compiled into
+# The app icon (the fork's minimal discovery mark; Resources/AppIcon/README.md): macOS 26 draws the layered AppIcon.icon (compiled into
 # Assets.car), older macOS the .icns. Without the former, macOS 26 shows the icon shrunk inside a gray square.
 ICON="Resources/AppIcon.icns"
 
@@ -51,7 +51,8 @@ cp Resources/AppIcon/tray.png Resources/AppIcon/tray-dim.png Resources/AppIcon/t
 # sandboxed apps and its headers for building against it: left out.
 FW="$APP/Contents/Frameworks/Sparkle.framework"
 mkdir -p "$APP/Contents/Frameworks"
-ditto .build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework "$FW"
+# Finder metadata on a downloaded framework's nested app is invalid in a newly signed bundle.
+ditto --norsrc --noextattr .build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework "$FW"
 for part in XPCServices Headers PrivateHeaders Modules; do rm -rf "${FW:?}/$part" "${FW:?}/Versions/B/$part"; done
 
 PLIST="$APP/Contents/Info.plist"
@@ -59,6 +60,10 @@ PLIST="$APP/Contents/Info.plist"
 [[ -n "${VERSION:-}" ]] && /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
 [[ -n "${BUILD_NUMBER:-}" ]] && /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$PLIST"
 [[ -n "${SPARKLE_FEED:-}" ]] && /usr/libexec/PlistBuddy -c "Set :SUFeedURL $SPARKLE_FEED" "$PLIST"
+if [[ "${FORK_UPDATES:-}" == 1 ]]; then
+  [[ -n "${SPARKLE_FEED:-}" && -n "${SPARKLE_KEY:-}" ]] || { echo "Fork updates need a feed and its signing key" >&2; exit 1; }
+  /usr/libexec/PlistBuddy -c "Set :DigUpForkBuild false" "$PLIST"
+fi
 [[ -n "${SPARKLE_KEY:-}" ]] && { /usr/libexec/PlistBuddy -c "Delete :SUPublicEDKey" "$PLIST" 2>/dev/null || true
                                  /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_KEY" "$PLIST"; }
 
@@ -67,10 +72,19 @@ PLIST="$APP/Contents/Info.plist"
 # entitlement lets it ask QuickTime Player to open a recording at a moment.
 IDENTITY="${SIGN_ID:-$( [[ -f .sign-id ]] && head -1 .sign-id || echo - )}"
 TIMESTAMP=$([[ "${RELEASE:-}" == 1 ]] && echo --timestamp || echo --timestamp=none)
+# Only generated build output: these Finder attributes are forbidden by codesign. Explicit removal is needed;
+# `xattr -c` alone can leave the FinderInfo bundle flag behind.
+clear_signing_metadata() {
+  for attribute in com.apple.ResourceFork com.apple.FinderInfo; do
+    xattr -dr "$attribute" "$APP" 2>/dev/null || true
+  done
+}
+clear_signing_metadata
 codesign --force --sign "$IDENTITY" --options runtime $TIMESTAMP "$APP/Contents/Helpers/digup"
 # Sparkle comes ad-hoc signed: its helpers, then the framework, with this identity (the app may only load code signed
 # by its own team).
 for code in "$FW/Versions/B/Autoupdate" "$FW/Versions/B/Updater.app" "$FW"; do
+  clear_signing_metadata
   codesign --force --sign "$IDENTITY" --options runtime $TIMESTAMP "$code"
 done
 # An ad-hoc build has no team, so the hardened runtime's library validation would refuse its (ad-hoc) Sparkle: such
@@ -81,6 +95,9 @@ if [[ "$IDENTITY" == - ]]; then
   cp Resources/DigUp.entitlements "$ENTITLEMENTS"
   /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" "$ENTITLEMENTS"
 fi
+clear_signing_metadata
 codesign --force --sign "$IDENTITY" --options runtime $TIMESTAMP --entitlements "$ENTITLEMENTS" "$APP"
+clear_signing_metadata
+codesign --verify --deep --strict "$APP"
 echo "Signed $([[ "$IDENTITY" == - ]] && echo ad-hoc || echo "with \"$IDENTITY\"") (hardened runtime)"
 echo "Built $APP"

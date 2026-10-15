@@ -2,12 +2,18 @@
 
 <h1 align="center">DigUp</h1>
 
+> **Independent efficiency fork by [100xA](https://github.com/100xA).**
+> DigUp was created by **[Abdur Rahim (ARahim3)](https://github.com/ARahim3/DigUp)**. The original app, search
+> engine, interface and documentation are his work, shared under the [MIT license](LICENSE). This fork adds
+> performance improvements, consistency fixes and a new minimal icon. Upstream copyright and dependency notices
+> are preserved. See [the fork's changes and validation](docs/EFFICIENCY.md).
+
 <p align="center"><b>Describe it. Dig it up.</b><br>
 Search the files on your computer by what's in them, with Google DeepMind's
 <a href="https://huggingface.co/google/embeddinggemma-2">EmbeddingGemma 2</a>.</p>
 
-<p align="center"><a href="https://github.com/ARahim3/DigUp/releases/latest"><b>Download for Mac</b></a> ·
-<a href="https://github.com/ARahim3/DigUp/releases/tag/v0.7.0-beta.1"><b>Windows and Linux (beta)</b></a><br>
+<p align="center"><a href="#build-from-source"><b>Build this fork</b></a> ·
+<a href="https://github.com/ARahim3/DigUp"><b>Original project</b></a><br>
 <sub>Free and open source. Everything runs on your computer.</sub></p>
 
 <p align="center"><img src="docs/demo.gif" width="800" alt="DigUp's search panel on a Mac, on Windows and on Linux: a zebra in a video, a podcast minute, a clause in a lease, a dog on the beach in English, Bengali and Arabic, and code that opens in Zed."></p>
@@ -36,10 +42,15 @@ so a search gets both the meaning and the exact string. On a Mac that includes t
 
 ## Private
 
-Nothing you index leaves your computer. DigUp goes online only to download the model once and to check for updates
-once a day. The update check sends nothing about your files, and you can turn it off. No account, no telemetry.
+Nothing you index leaves your computer. DigUp goes online to download the model once. Upstream release builds also
+check for updates once a day; these checks are disabled in this source fork. No account, no telemetry.
 
 ## Install
+
+This fork is currently distributed as source. Build it using the instructions below. The official upstream packages
+listed here are Abdur Rahim's releases and do not include this fork's changes. Automatic upstream updates are
+disabled in fork builds so they cannot replace the fork; a maintainer must configure a separate signed feed before
+enabling updates.
 
 **Mac.** Download the DMG from [Releases](https://github.com/ARahim3/DigUp/releases/latest) and drag DigUp to
 Applications, or use Homebrew: `brew install --cask arahim3/tap/digup`. It needs an Apple Silicon Mac with macOS 14 or
@@ -67,8 +78,8 @@ Then, on any of them:
 2. Press the shortcut in any app and describe what you're looking for: **⇧⌘Space** on a Mac, **Ctrl+Shift+Space** on
    Windows and Linux.
 
-DigUp keeps itself up to date: the Mac app, the Windows installer and the AppImage install updates with one click.
-With the .deb, DigUp tells you when there's a new version and opens its release page.
+Upstream packages keep themselves up to date: the Mac app, Windows installer and AppImage install updates with one
+click, while the .deb opens its release page. Rebuild this source fork to get its changes.
 
 ## Using it
 
@@ -173,7 +184,7 @@ Tools, switch to Xcode first (`sudo xcode-select -s /Applications/Xcode.app`): t
 macros the build needs.
 
 ```sh
-git clone https://github.com/ARahim3/DigUp && cd DigUp
+    git clone https://github.com/100xA/DigUp && cd DigUp
 scripts/build-llama.sh            # llama.cpp at a pinned tag, with a one-line patch (a few minutes)
 swift build -c release && swift test
 ./build.sh                        # → build.noindex/DigUp.app

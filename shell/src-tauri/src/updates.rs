@@ -107,6 +107,10 @@ fn log(shell: &Shell, line: &str) {
 /// the last check. Not in dev runs or debug builds (they'd read the real feed), unless `--debug-update-check` asks for
 /// one check at once (then `--debug-update-install` takes what it finds without asking).
 pub fn start(app: &AppHandle) {
+    // A source fork must opt in with its own signed feed instead of installing an upstream release over itself.
+    if option_env!("DIGUP_ENABLE_SIGNED_UPDATES") != Some("1") {
+        return;
+    }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     log(&shell, &format!("DigUp {} started", app.package_info().version));
     let debug = shell.options.debug_update_check;
@@ -135,6 +139,13 @@ pub fn start(app: &AppHandle) {
 /// Reads the feed. `asked`: the person chose Check for Updates…, and hears the answer (an update is then offered at
 /// once); a daily check stays quiet and lets an update wait.
 pub async fn check(app: &AppHandle, asked: bool) {
+    if option_env!("DIGUP_ENABLE_SIGNED_UPDATES") != Some("1") {
+        if asked {
+            app.dialog().message("Updates are disabled for this source fork. Build the latest version from github.com/100xA/DigUp.")
+                .title("DigUp updates").kind(MessageDialogKind::Info).show(|_| {});
+        }
+        return;
+    }
     let shell = app.state::<Arc<Shell>>().inner().clone();
     {
         let mut phase = shell.updates.phase.lock().unwrap();
