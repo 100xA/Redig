@@ -15,6 +15,8 @@ public struct CrawlReport: Sendable {
     public var skipped: [String: Int] = [:]          // reason → files
     public var skippedFolders: [String: Int] = [:]   // reason → folders not walked into
     public var datasets: [String: Int] = [:]         // folder → files skipped as a dataset
+    /// Paths observed but unavailable, or subtrees whose enumeration failed. Their existing index entries survive.
+    public var unavailable: [String] = []
 }
 
 /// Walks the chosen folders and applies `Rules`. Reads metadata only, never file contents (except the 600-byte
@@ -32,9 +34,10 @@ public enum Crawler {
         var repos = GitRepos()
         var found: [Candidate] = []
         var foundPaths = Set<String>()   // a folder inside another root would be walked twice
-        let rootPaths = Set(roots.map { $0.standardizedFileURL.path })
+        let canonicalRoots = roots.map { URL(fileURLWithPath: FolderSelection.realPath($0.path), isDirectory: true) }
+        let rootPaths = Set(canonicalRoots.map(\.path))
 
-        for root in roots.map({ $0.standardizedFileURL }) {
+        for root in canonicalRoots {
             if options.code {
                 repos.enterRoot(root.path)
             } else if Rules.isProjectRoot(root.path) {
@@ -43,7 +46,7 @@ public enum Crawler {
             // A skip applies inside the chosen folders that contain it: a folder chosen inside a skipped one is
             // walked whole (`FolderSelection`). The walk reports real paths (/private/var, where the root says /var).
             let real = FolderSelection.realPath(root.path)
-            let skips = options.excludedFolders.filter {
+            let skips = options.excludedFolders.map(FolderSelection.realPath).filter {
                 FolderSelection.isInside($0, root.path) || FolderSelection.isInside($0, real)
             }.flatMap { [$0, FolderSelection.realPath($0)] }
             #if os(Windows)
@@ -51,12 +54,23 @@ public enum Crawler {
             #else
             guard let walker = fm.enumerator(at: root, includingPropertiesForKeys: keys,
                                              options: [.skipsHiddenFiles, .skipsPackageDescendants],
-                                             errorHandler: { _, _ in true }) else { continue }
+                                             errorHandler: { url, _ in
+                                                 report.unavailable.append(FolderSelection.realPath(url.path))
+                                                 return true
+                                             }) else {
+                report.unavailable.append(root.path)
+                continue
+            }
             #endif
             func visit(_ url: URL) {
-                let values = try? url.resourceValues(forKeys: Set(keys))
+                let values: URLResourceValues
+                do { values = try url.resourceValues(forKeys: Set(keys)) } catch {
+                    report.unavailable.append(url.path)
+                    walker.skipDescendants()
+                    return
+                }
                 let isPackage = FileSystem.isPackage(url, values)
-                if values?.isDirectory == true, !isPackage {
+                if values.isDirectory == true, !isPackage {
                     if let reason = Rules.skipReason(forFolder: url, home: home, excluded: skips)
                         ?? (options.code ? Rules.codeSkipReason(forFolder: url) : nil) {
                         walker.skipDescendants()
@@ -73,6 +87,20 @@ public enum Crawler {
                     report.skipped["app or bundle", default: 0] += 1
                     return
                 }
+                // Check availability before classification: sniffing a .ts/.mts file opens its contents.
+                guard let info = FileSystem.info(of: url.path) else {
+                    report.unavailable.append(url.path)
+                    return
+                }
+                guard info.isRegular else {
+                    report.skipped["link or special file", default: 0] += 1
+                    return
+                }
+                if info.dataless || FileSystem.isInCloud(values) {
+                    report.skipped["in the cloud, not downloaded", default: 0] += 1
+                    report.unavailable.append(url.path)
+                    return
+                }
                 let classification = options.code ? Rules.classifyCode(url, options: options)
                     : Rules.classify(url, values: values, options: options)
                 switch classification {
@@ -81,15 +109,6 @@ public enum Crawler {
                 case .skip(let reason):
                     report.skipped[reason, default: 0] += 1
                 case .index(let kind):
-                    guard let info = FileSystem.info(of: url.path), info.isRegular else {
-                        report.skipped["link or special file", default: 0] += 1
-                        return
-                    }
-                    // Reading a dataless placeholder (iCloud "Optimize Mac Storage", File Providers) downloads it.
-                    if info.dataless || FileSystem.isInCloud(values) {
-                        report.skipped["in the cloud, not downloaded", default: 0] += 1
-                        return
-                    }
                     if options.code {
                         // Too big to be written by hand; a notebook's file holds its outputs too.
                         let limit = url.pathExtension.lowercased() == "ipynb" ? options.maxNotebookBytes
@@ -116,6 +135,9 @@ public enum Crawler {
                     visit(url)
                 }
             }
+            #if os(Windows)
+            report.unavailable += walker.failedFolders
+            #endif
         }
 
         // Inside a code project only screenshots count (assets, fixtures and datasets don't).
@@ -152,6 +174,7 @@ public enum Crawler {
             }
         }
         report.candidates = kept
+        report.unavailable += repos.unavailable
         return report
     }
 }
@@ -164,13 +187,22 @@ struct GitRepos {
     private var files: [String: Set<String>?] = [:]
     /// Folder → the repo it's in (nil: none), as the walk found them.
     private var repoOf: [String: String?] = [:]
+    private var loaded = Set<String>()
+    private(set) var unavailable: [String] = []
+
+    private mutating func load(_ folder: String) {
+        guard loaded.insert(folder).inserted else { return }
+        let listed = GitFiles.list(folder)
+        files[folder] = .some(listed)
+        if listed == nil { unavailable.append(folder) }
+    }
 
     /// A chosen folder: a repo itself, or inside one (a repo's subfolder chosen on its own).
     mutating func enterRoot(_ path: String) {
         var folder = path
         while true {
             if FileManager.default.fileExists(atPath: folder + "/.git") {
-                files[folder] = GitFiles.list(folder)
+                load(folder)
                 repoOf[path] = folder
                 return
             }
@@ -186,7 +218,7 @@ struct GitRepos {
     mutating func enter(_ path: String) {
         var isFolder: ObjCBool = false
         if FileManager.default.fileExists(atPath: path + "/.git", isDirectory: &isFolder), isFolder.boolValue {
-            files[path] = GitFiles.list(path)
+            load(path)
             repoOf[path] = path
         }
     }
@@ -196,14 +228,14 @@ struct GitRepos {
         if let known = repoOf[folder] { return known }
         let parent = (folder as NSString).deletingLastPathComponent
         let answer = parent != folder && parent.count > 1 ? repo(of: parent) : nil
-        repoOf[folder] = answer
+        repoOf[folder] = .some(answer)
         return answer
     }
 
     /// Whether git ignores the file at `path` (in a repo whose files git listed).
     mutating func ignores(_ path: String) -> Bool {
-        guard let repo = repo(of: (path as NSString).deletingLastPathComponent), let kept = files[repo] ?? nil
-        else { return false }
+        guard let repo = repo(of: (path as NSString).deletingLastPathComponent) else { return false }
+        guard let kept = files[repo] ?? nil else { return false }
         return !kept.contains(String(path.dropFirst(repo.count + 1)))
     }
 }

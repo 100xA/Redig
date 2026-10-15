@@ -29,80 +29,225 @@ public struct SearchHit: Sendable {
 /// the distribution comes for free, and only segments that stand out (`zGate`) count as meaning matches. That also
 /// gives an honest "nothing found". Words rescue what a vector can't hold exactly: codes, IDs and names.
 public final class Searcher {
+    /// Query vectors carry their source all the way to the loaded index snapshot.
+    public struct QueryVector: Sendable {
+        public let values: [Float]
+        public let source: String
+        public init(values: [Float], source: String) { self.values = values; self.source = source }
+    }
+
     let store: IndexStore
-    private var matrix: VectorStorage?   // rows × 768 float16, row-major
+    private var matrix: VectorStorage?
     private var rowFile: [Int64] = []
     private var rowSegment: [Int64] = []
     private var rowModality: [Modality] = []
-    /// False for the vectors the later pass adds (`Indexer.finishLongFiles`): scored, but they don't set the scale.
     private var rowSetsScale: [Bool] = []
+    private var rowKind: [SegmentKind] = []
+    private var rowPlace: [Int] = []
+    private var segmentRow: [Int64: Int] = [:]
+    private var vectorSegments: [Int64: [Int64]] = [:]
+    private var segmentFile: [Int64: Int64] = [:]
+    private var fileSegments: [Int64: [Int64]] = [:]
     private var fileKind: [Int64: FileKind] = [:]
+    private var filePath: [Int64: String] = [:]
+    private var filePages: [Int64: Int] = [:]
+    private var metadataGeneration: Int64?
+    private var vectorGeneration: Int64?
+    private var matrixSource: String?
     public private(set) var vectorSource: String?
-    /// False after `releaseVectors()` (or `loadVectors: false`): keyword search still works, and the next search with
-    /// a query vector loads them again.
     public private(set) var vectorsLoaded = false
+    public private(set) var lastQueryUsedMeaning = false
+    /// Diagnostics used by regression/performance tests: unchanged and metadata-only refreshes read no vector blobs.
+    private(set) var refreshedVectorRows = 0
+    private(set) var refreshWasFull = false
 
     public var vectorCount: Int { rowFile.count }
-
-    /// This is the code index's searcher (`IndexStore.codeFile`): names are looked up as names (`CodeLookup`).
     public var isCode: Bool { store.file.lastPathComponent == IndexStore.codeFile }
 
-    /// With `loadVectors: false` only keyword search is ready; vectors load on the first meaning search. The app
-    /// uses that to stay small while idle: 20k vectors are ~30 MB.
     public init(store: IndexStore, loadVectors: Bool = true) throws {
         self.store = store
-        if loadVectors { try reload() } else { try reloadFiles() }
+        try store.db.readTransaction { try update(loadVectors: loadVectors) }
     }
 
-    /// Reads the files and all vectors again (after indexing added some).
+    /// Force a complete snapshot, for recovery or an explicit rebuild. Ordinary indexing calls use `refresh()`.
     public func reload() throws {
-        releaseVectors()
-        try reloadFiles()
-        var rows = 0
-        try store.db.query("SELECT COUNT(*) FROM segments WHERE vec IS NOT NULL") { rows = Int($0.int(0)) }
-        guard let matrix = VectorStorage(rows: rows) else {
-            vectorsLoaded = true   // nothing to load
-            return
+        try store.db.readTransaction {
+            metadataGeneration = nil
+            vectorGeneration = nil
+            try update(loadVectors: true)
         }
-        let rowBytes = Vectors.dimension * MemoryLayout<Float16>.stride
-        let steps = IndexOptions()
-        try store.db.query("""
-            SELECT s.id, s.file, s.modality, s.vec, s.kind, s.loc, f.kind, CAST(json_extract(f.info, '$.pages') AS INTEGER)
-            FROM segments s JOIN files f ON f.id = s.file WHERE s.vec IS NOT NULL ORDER BY s.id
-            """) { row in
-            guard let blob = row.blob(3), blob.count == rowBytes, rowFile.count < rows else { return }
-            blob.copyBytes(to: UnsafeMutableRawBufferPointer(start: matrix.halves + rowFile.count * Vectors.dimension,
-                                                             count: rowBytes))
-            rowSegment.append(row.int(0))
-            rowFile.append(row.int(1))
-            rowModality.append(Modality(rawValue: row.text(2) ?? "") ?? .none)
-            // Past the first step of a long PDF (its pages) or document (its chunks).
-            let (kind, place) = (row.text(4), row.isNull(5) ? 0 : Int(row.double(5)))
-            let later = row.text(6) == "pdf"
-                ? kind != SegmentKind.chunk.rawValue && Int(row.int(7)) > steps.bigPDFPages && place > steps.pdfStep
-                : kind == SegmentKind.chunk.rawValue && place > steps.docStep
-            rowSetsScale.append(!later)
-        }
-        self.matrix = matrix
-        vectorsLoaded = true
     }
 
-    /// Frees the vectors' memory; keyword search keeps working.
+    /// Observe committed changes without reading unchanged vector blobs. The writer never waits for this read snapshot.
+    public func refresh() throws {
+        try store.db.readTransaction { try update(loadVectors: vectorsLoaded) }
+    }
+
     public func releaseVectors() {
         matrix = nil
-        rowFile = []
-        rowSegment = []
-        rowModality = []
-        rowSetsScale = []
+        rowFile = []; rowSegment = []; rowModality = []; rowSetsScale = []; rowKind = []; rowPlace = []
+        segmentRow = [:]
+        vectorSegments = [:]
         vectorsLoaded = false
+        vectorGeneration = nil
+        matrixSource = nil
     }
 
-    private func reloadFiles() throws {
-        fileKind.removeAll(keepingCapacity: true)
-        try store.db.query("SELECT id, kind FROM files") { row in
-            fileKind[row.int(0)] = FileKind(rawValue: row.text(1) ?? "")
+    private func update(loadVectors: Bool, refreshLoaded: Bool = true) throws {
+        refreshedVectorRows = 0
+        refreshWasFull = false
+        let generation = try store.searchGeneration()
+        let oldMetadata = metadataGeneration
+        let fullMetadata = oldMetadata == nil || oldMetadata! < generation.floor || oldMetadata! > generation.current
+        var changed: [(file: Int64, vectors: Int64)] = []
+        if fullMetadata || oldMetadata != generation.current {
+            if fullMetadata {
+                fileKind.removeAll(keepingCapacity: true)
+                filePath.removeAll(keepingCapacity: true)
+                filePages.removeAll(keepingCapacity: true)
+                segmentFile.removeAll(keepingCapacity: true)
+                fileSegments.removeAll(keepingCapacity: true)
+                try readFiles()
+                try readSegmentFiles()
+            } else {
+                try store.db.query("SELECT file, vector_generation FROM search_changes WHERE generation > ?",
+                                   [.int(oldMetadata!)]) { changed.append(($0.int(0), $0.int(1))) }
+                for change in changed {
+                    fileKind[change.file] = nil; filePath[change.file] = nil; filePages[change.file] = nil
+                    if let segments = fileSegments.removeValue(forKey: change.file) {
+                        for id in segments { segmentFile[id] = nil }
+                    }
+                }
+                try batches(changed.map(\.file)) { ids in
+                    try readFiles(whereSQL: " WHERE id IN (\(ids))")
+                    try readSegmentFiles(whereSQL: " WHERE file IN (\(ids))")
+                }
+            }
+            vectorSource = try store.meta("vector_source")
+            metadataGeneration = generation.current
         }
-        vectorSource = try store.meta("vector_source")
+        guard loadVectors || (refreshLoaded && vectorsLoaded) else { return }
+        do {
+            if !vectorsLoaded || vectorGeneration == nil || vectorGeneration! < generation.floor || matrixSource != vectorSource || fullMetadata {
+                try loadAllVectors()
+                refreshWasFull = true
+            } else if vectorGeneration != generation.current {
+                // Metadata may have been refreshed by a keyword query while vectors were released. If it advanced
+                // independently, ask the journal from the vector snapshot, rather than losing those intervening edits.
+                if oldMetadata != vectorGeneration {
+                    changed = []
+                    try store.db.query("SELECT file, vector_generation FROM search_changes WHERE generation > ?",
+                                       [.int(vectorGeneration!)]) { changed.append(($0.int(0), $0.int(1))) }
+                }
+                let vectorFiles = changed.filter { $0.vectors > vectorGeneration! }.map(\.file)
+                for file in vectorFiles { removeVectors(of: file) }
+                try batches(vectorFiles) { ids in try readVectors(whereSQL: " AND file IN (\(ids))") }
+                for change in changed {
+                    for id in fileSegments[change.file] ?? [] {
+                        if let row = segmentRow[id] { rowSetsScale[row] = setsScale(file: change.file, kind: rowKind[row], place: rowPlace[row]) }
+                    }
+                }
+            }
+            vectorsLoaded = true
+            vectorGeneration = generation.current
+            matrixSource = vectorSource
+        } catch {
+            // A partial refresh must never become a searchable matrix. The next request retries a full snapshot.
+            releaseVectors()
+            metadataGeneration = nil
+            throw error
+        }
+    }
+
+    private func batches(_ files: [Int64], _ body: (String) throws -> Void) rethrows {
+        for start in stride(from: 0, to: files.count, by: 500) {
+            try body(files[start..<min(start + 500, files.count)].map(String.init).joined(separator: ","))
+        }
+    }
+
+    private func readFiles(whereSQL: String = "") throws {
+        try store.db.query("SELECT id, path, kind, CAST(json_extract(info, '$.pages') AS INTEGER) FROM files\(whereSQL)") {
+            let id = $0.int(0)
+            filePath[id] = $0.text(1) ?? ""
+            fileKind[id] = FileKind(rawValue: $0.text(2) ?? "") ?? .doc
+            filePages[id] = Int($0.int(3))
+        }
+    }
+
+    private func readSegmentFiles(whereSQL: String = "") throws {
+        // The covering indexes contain these integers without touching pages holding vector blobs.
+        let index = whereSQL.isEmpty ? "segments_search" : "segments_file"
+        try store.db.query("SELECT id, file FROM segments INDEXED BY \(index)\(whereSQL)") {
+            let id = $0.int(0), file = $0.int(1)
+            segmentFile[id] = file
+            fileSegments[file, default: []].append(id)
+        }
+    }
+
+    private func setsScale(file: Int64, kind: SegmentKind, place: Int) -> Bool {
+        let steps = IndexOptions()
+        return !(fileKind[file] == .pdf
+            ? kind != .chunk && filePages[file, default: 0] > steps.bigPDFPages && place > steps.pdfStep
+            : kind == .chunk && place > steps.docStep)
+    }
+
+    private func loadAllVectors() throws {
+        releaseVectors()
+        var rows = 0
+        try store.db.query("SELECT COUNT(*) FROM segments WHERE vec IS NOT NULL") { rows = Int($0.int(0)) }
+        try ensureCapacity(rows)
+        rowFile.reserveCapacity(rows); rowSegment.reserveCapacity(rows); rowModality.reserveCapacity(rows)
+        rowSetsScale.reserveCapacity(rows); rowKind.reserveCapacity(rows); rowPlace.reserveCapacity(rows)
+        segmentRow.reserveCapacity(rows)
+        try readVectors()
+    }
+
+    private func ensureCapacity(_ rows: Int) throws {
+        guard rows > (matrix?.rows ?? 0) else { return }
+        let spare = max(256, rows / 4)
+        guard rows <= Int.max - spare else { throw Database.Failure(message: "search vector capacity is too large") }
+        let capacity = max(rows + spare, (matrix?.rows ?? 0) + max(256, (matrix?.rows ?? 0) / 2))
+        guard let next = VectorStorage(rows: capacity) else { throw Database.Failure(message: "not enough memory to load search vectors") }
+        if let matrix, !rowFile.isEmpty { next.halves.update(from: matrix.halves, count: rowFile.count * Vectors.dimension) }
+        matrix = next
+    }
+
+    private func readVectors(whereSQL: String = "") throws {
+        try store.db.query("SELECT id, file, modality, vec, kind, loc FROM segments WHERE vec IS NOT NULL\(whereSQL) ORDER BY id") { row in
+            let bytes = Vectors.dimension * MemoryLayout<Float16>.stride
+            try row.withBlob(3) { blob in
+                guard blob.count == bytes else { return }
+                try ensureCapacity(rowFile.count + 1)
+                let index = rowFile.count, file = row.int(1), id = row.int(0)
+                UnsafeMutableRawBufferPointer(start: matrix!.halves + index * Vectors.dimension, count: bytes).copyMemory(from: blob)
+                let kind = SegmentKind(rawValue: row.text(4) ?? "") ?? .chunk
+                let place = row.isNull(5) ? 0 : Int(row.double(5))
+                rowFile.append(file); rowSegment.append(id)
+                rowModality.append(Modality(rawValue: row.text(2) ?? "") ?? .none)
+                rowKind.append(kind); rowPlace.append(place)
+                rowSetsScale.append(setsScale(file: file, kind: kind, place: place))
+                segmentRow[id] = index
+                vectorSegments[file, default: []].append(id)
+                refreshedVectorRows += 1
+            }
+        }
+    }
+
+    private func removeVectors(of file: Int64) {
+        for id in vectorSegments.removeValue(forKey: file) ?? [] { if let row = segmentRow[id] { removeVector(at: row) } }
+    }
+
+    private func removeVector(at row: Int) {
+        let last = rowFile.count - 1
+        segmentRow[rowSegment[row]] = nil
+        if row != last {
+            matrix!.halves.advanced(by: row * Vectors.dimension).update(from: matrix!.halves + last * Vectors.dimension, count: Vectors.dimension)
+            rowFile[row] = rowFile[last]; rowSegment[row] = rowSegment[last]; rowModality[row] = rowModality[last]
+            rowSetsScale[row] = rowSetsScale[last]; rowKind[row] = rowKind[last]; rowPlace[row] = rowPlace[last]
+            segmentRow[rowSegment[row]] = row
+        }
+        rowFile.removeLast(); rowSegment.removeLast(); rowModality.removeLast()
+        rowSetsScale.removeLast(); rowKind.removeLast(); rowPlace.removeLast()
     }
 
     /// How much finding the query's words counts against meaning (`search`). Code's words count for less: they're
@@ -112,21 +257,70 @@ public final class Searcher {
     public static let wordWeight = 2.0
     public static let codeWordWeight = 1.0
 
+    /// Source-aware search. Reloading and validation share the same committed snapshot.
+    /// `eligible` is a cheap scope/kind rule. `available` can check the filesystem: only ranked candidates are checked,
+    /// and missing files are replaced before the result limit is applied.
+    public func search(_ text: String, query: QueryVector?, kinds: Set<FileKind>? = nil, limit: Int = 20,
+                       zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false,
+                       eligible: ((String, FileKind) -> Bool)? = nil,
+                       available: ((String) -> Bool)? = nil) throws -> [SearchHit] {
+        try store.db.readTransaction {
+            try update(loadVectors: false, refreshLoaded: false)
+            let values = query.flatMap { $0.source == vectorSource ? $0.values : nil }
+            if values != nil { try update(loadVectors: true) }
+            else if matrixSource != vectorSource { releaseVectors() }
+            return try searchSnapshot(text, queryVector: values, kinds: kinds, limit: limit, zGate: zGate,
+                                      wordWeight: wordWeight, prefixLast: prefixLast, eligible: eligible, available: available)
+        }
+    }
+
+    /// Compatibility for callers that already ensure source compatibility. New hosts should use `query:`.
     public func search(_ text: String, queryVector: [Float]?, kinds: Set<FileKind>? = nil, limit: Int = 20,
-                       zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false) throws -> [SearchHit] {
+                       zGate: Double = 2.0, wordWeight: Double? = nil, prefixLast: Bool = false,
+                       eligible: ((String, FileKind) -> Bool)? = nil,
+                       available: ((String) -> Bool)? = nil) throws -> [SearchHit] {
+        try store.db.readTransaction {
+            try update(loadVectors: queryVector != nil)
+            return try searchSnapshot(text, queryVector: queryVector, kinds: kinds, limit: limit, zGate: zGate,
+                                      wordWeight: wordWeight, prefixLast: prefixLast, eligible: eligible, available: available)
+        }
+    }
+
+    private func searchSnapshot(_ text: String, queryVector: [Float]?, kinds: Set<FileKind>?, limit: Int,
+                                zGate: Double, wordWeight: Double?, prefixLast: Bool,
+                                eligible: ((String, FileKind) -> Bool)?,
+                                available: ((String) -> Bool)?) throws -> [SearchHit] {
+        lastQueryUsedMeaning = false
+        guard limit > 0 else { return [] }
         let wordWeight = wordWeight ?? (isCode ? Self.codeWordWeight : Self.wordWeight)
-        if queryVector != nil, !vectorsLoaded { try reload() }
-        let fileKind = self.fileKind
-        let allowed = { (file: Int64) -> Bool in kinds == nil || fileKind[file].map { kinds!.contains($0) } ?? false }
+        var eligibility: [Int64: Bool] = [:], availability: [Int64: Bool] = [:]
+        func allowed(_ file: Int64) -> Bool {
+            if let known = eligibility[file] { return known }
+            guard let kind = fileKind[file], let path = filePath[file] else { eligibility[file] = false; return false }
+            let value = (kinds == nil || kinds!.contains(kind)) && (eligible?(path, kind) ?? true)
+            eligibility[file] = value
+            return value
+        }
+        func isAvailable(_ file: Int64) -> Bool {
+            if let known = availability[file] { return known }
+            let value = filePath[file].map { available?($0) ?? true } ?? false
+            availability[file] = value
+            return value
+        }
+        lastQueryUsedMeaning = queryVector?.count == Vectors.dimension && !rowFile.isEmpty
 
         // Meaning: score every vector on this query's scale (`meaning`), keep each file's best segment.
         var best: [Int64: (z: Double, cosine: Double, row: Int)] = [:]
         if let query = queryVector, query.count == Vectors.dimension, !rowFile.isEmpty {
             let scores = score(query)
             let meaning = Self.meaning(scores, rowModality, setsScale: rowSetsScale)
-            for row in 0..<scores.count where allowed(rowFile[row]) {
+            for row in 0..<scores.count {
                 let z = meaning[row]
-                if z > (best[rowFile[row]]?.z ?? -.infinity) { best[rowFile[row]] = (z, Double(scores[row]), row) }
+                let previous = best[rowFile[row]]
+                if z > (previous?.z ?? -.infinity)
+                    || (z == previous?.z && rowSegment[row] < rowSegment[previous!.row]) {
+                    best[rowFile[row]] = (z, Double(scores[row]), row)
+                }
             }
         }
 
@@ -134,7 +328,7 @@ public final class Searcher {
         // ("quantize_row_q8_0_ref") is matched as one phrase, as it's written.
         let terms = Self.terms(text)
         let identifier = isCode ? CodeLookup.identifier(text) : nil
-        var words: [(file: Int64, segment: Int64, snippet: String?)] = []
+        var words: [(file: Int64, segment: Int64)] = []
         var coverage: [Int64: Double] = [:]   // share of the query's words found anywhere in the file
         var patterns = identifier.map { [CodeLookup.phrase($0)] } ?? Self.patterns(terms, prefixLast: prefixLast)
         // A word that's in no file as typed matches as the start of longer words, as the last word does while it's
@@ -149,24 +343,24 @@ public final class Searcher {
         }
         if !patterns.isEmpty {
             var seen = Set<Int64>()
-            try store.db.query("""
-                SELECT s.file, s.id, snippet(fts, 1, '«', '»', '…', 12), fts.original FROM fts
-                JOIN segments s ON s.id = fts.rowid
-                WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000
+            // Rank cheap row IDs first. A long file cannot consume a segment cap, and excluded files do not consume
+            // the distinct-file budget. Snippets are read only for the final hits, after fusion.
+            try store.db.queryUntil("""
+                SELECT rowid FROM fts WHERE fts MATCH ? AND rank MATCH 'bm25(3.0, 1.0)' ORDER BY rank
                 """, [.text(patterns.joined(separator: " OR "))]) { row in
-                let file = row.int(0)
-                guard words.count < 100, allowed(file), seen.insert(file).inserted else { return }
-                // Text that normalizing changed is quoted as it's written (with its hamza, harakat, joiners).
-                let snippet = row.text(3).flatMap { SearchText.snippet($0, terms: terms) } ?? row.text(2)
-                words.append((file, row.int(1), snippet))
+                guard let file = segmentFile[row.int(0)], seen.insert(file).inserted, allowed(file), isAvailable(file) else { return true }
+                words.append((file, row.int(0)))
+                return words.count < max(100, limit)
             }
             if !words.isEmpty {
-                let files = words.map { String($0.file) }.joined(separator: ",")
                 for pattern in patterns {
-                    try store.db.query("""
-                        SELECT DISTINCT s.file FROM fts JOIN segments s ON s.id = fts.rowid
-                        WHERE fts MATCH ? AND s.file IN (\(files))
-                        """, [.text(pattern)]) { coverage[$0.int(0), default: 0] += 1 / Double(patterns.count) }
+                    var remaining = Set(words.map(\.file))
+                    try store.db.queryUntil("SELECT rowid FROM fts WHERE fts MATCH ?", [.text(pattern)]) { row in
+                        if let file = segmentFile[row.int(0)], remaining.remove(file) != nil {
+                            coverage[file, default: 0] += 1 / Double(patterns.count)
+                        }
+                        return !remaining.isEmpty
+                    }
                 }
             }
         }
@@ -178,7 +372,7 @@ public final class Searcher {
         let lookup = Self.isLookup(terms) || identifier != nil
         let (meaningWeight, wordsWeight) = lookup ? (0.5, wordWeight * 2) : (1, wordWeight)
         let hinted = Self.kindHints(text)
-        var candidates = Set(best.filter { $0.value.z >= zGate }.keys)
+        var candidates = Set(best.filter { $0.value.z >= zGate && allowed($0.key) }.keys)
         for (file, share) in coverage where share >= 0.5 { candidates.insert(file) }
         var scored: [Int64: Double] = [:]
         for file in candidates {
@@ -190,8 +384,13 @@ public final class Searcher {
         let wordRank = Dictionary(words.enumerated().map { ($0.element.file, ($0.offset + 1, $0.element)) },
                                   uniquingKeysWith: { first, _ in first })
         var hits: [SearchHit] = []
-        for (file, score) in scored.sorted(by: { $0.value > $1.value || ($0.value == $1.value && $0.key < $1.key) })
-            .prefix(limit) {
+        for (file, score) in scored.sorted(by: {
+            if $0.value != $1.value { return $0.value > $1.value }
+            let left = wordRank[$0.key]?.0 ?? Int.max, right = wordRank[$1.key]?.0 ?? Int.max
+            return left != right ? left < right : $0.key < $1.key
+        }) {
+            guard hits.count < limit else { break }
+            guard isAvailable(file) else { continue }
             let rank = hits.count
             let semantic = best[file]
             let keyword = wordRank[file]
@@ -217,20 +416,30 @@ public final class Searcher {
                     info = (try? JSONSerialization.jsonObject(with: json) as? [String: String]) ?? [:]
                 }
             }
+            var keywordSnippet: String?
+            if let keyword {
+                try store.db.query("SELECT snippet(fts, 1, '«', '»', '…', 12), original FROM fts WHERE fts MATCH ? AND rowid = ?",
+                                   [.text(patterns.joined(separator: " OR ")), .int(keyword.1.segment)]) {
+                    keywordSnippet = $0.text(1).flatMap { SearchText.snippet($0, terms: terms) } ?? $0.text(0)
+                }
+            }
             var segment = SegmentKind.name, loc: Double?, locEnd: Double?, storedExcerpt: String?
-            try store.db.query("SELECT kind, loc, loc_end, excerpt FROM segments WHERE id = ?", [.int(segmentID)]) {
+            var foundSegment = false
+            try store.db.query("SELECT kind, loc, loc_end, excerpt FROM segments WHERE id = ? AND file = ?", [.int(segmentID), .int(file)]) {
+                foundSegment = true
                 segment = SegmentKind(rawValue: $0.text(0) ?? "") ?? .name
                 loc = $0.isNull(1) ? nil : $0.double(1)
                 locEnd = $0.isNull(2) ? nil : $0.double(2)
                 storedExcerpt = $0.text(3)
             }
+            guard foundSegment, !path.isEmpty else { continue }
             // Quote the matched words only when they come from the segment we point at, so a PDF hit on page 5
             // never shows page 2's words. A segment with no place and no text of its own (a screenshot's image
             // vector) can borrow them from its file's OCR text, which describes the same picture.
-            var snippet = keyword.flatMap { $0.1.segment == segmentID ? $0.1.snippet : nil }
+            var snippet = keyword.flatMap { $0.1.segment == segmentID ? keywordSnippet : nil }
                 .flatMap { $0.contains("«") ? excerpt($0, limit: 400) : nil }
             if snippet == nil, storedExcerpt == nil, loc == nil, let match = keyword?.1,
-               let text = match.snippet, text.contains("«") {
+               let text = keywordSnippet, text.contains("«") {
                 var matchedKind: String?
                 try store.db.query("SELECT kind FROM segments WHERE id = ?", [.int(match.segment)]) {
                     matchedKind = $0.text(0)
@@ -324,7 +533,10 @@ public final class Searcher {
     /// files finished: real eval 24 → 22 of 26 first; 24 with the scale kept).
     static func meaning(_ scores: [Float], _ modality: [Modality], setsScale: [Bool]? = nil) -> [Double] {
         let means = modalityMeans(scores, modality, setsScale: setsScale)
-        let centered = zip(scores, modality).map { Double($0) - means[$1, default: 0] }
+        let byModality = SIMD4(means[.none, default: 0], means[.text, default: 0],
+                              means[.image, default: 0], means[.audio, default: 0])
+        // The distribution is unchanged; fixed slots avoid hashing an enum for every scored vector.
+        let centered = scores.indices.map { Double(scores[$0]) - byModality[modalityIndex(modality[$0])] }
         var count = 0.0, sum = 0.0
         for row in centered.indices where setsScale?[row] ?? true {
             count += 1
@@ -341,21 +553,27 @@ public final class Searcher {
 
     /// The average score of each modality for this query. Small groups (< 20 vectors) take the average of all.
     static func modalityMeans(_ scores: [Float], _ modality: [Modality], setsScale: [Bool]? = nil) -> [Modality: Double] {
-        var sum: [Modality: Double] = [:], count: [Modality: Int] = [:]
+        var sum = SIMD4<Double>.zero, count = SIMD4<Double>.zero
         for row in scores.indices where setsScale?[row] ?? true {
-            sum[modality[row], default: 0] += Double(scores[row])
-            count[modality[row], default: 0] += 1
+            let index = modalityIndex(modality[row])
+            sum[index] += Double(scores[row])
+            count[index] += 1
         }
-        let all = sum.values.reduce(0, +) / Double(max(count.values.reduce(0, +), 1))
+        let all = sum.sum() / max(count.sum(), 1)
         var out: [Modality: Double] = [:]
         for modality in Modality.allCases {
-            if let n = count[modality], n >= 20 {
-                out[modality] = sum[modality]! / Double(n)
+            let index = modalityIndex(modality)
+            if count[index] >= 20 {
+                out[modality] = sum[index] / count[index]
             } else {
                 out[modality] = all
             }
         }
         return out
+    }
+
+    private static func modalityIndex(_ modality: Modality) -> Int {
+        switch modality { case .none: 0; case .text: 1; case .image: 2; case .audio: 3 }
     }
 
     /// The text of a page, a document's passage or a screenshot's OCR, as it's written: the preview shows the part of a

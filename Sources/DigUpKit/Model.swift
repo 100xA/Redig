@@ -65,6 +65,8 @@ public struct IndexOptions: Sendable {
     public var frameInterval = 3.0         // seconds between sampled video frames (near-duplicates are dropped)
     public var audioWindow = 30.0          // the model silently ignores audio past 30 s of one input
     public var audioHop = 25.0
+    /// At most this many audio windows (and the corresponding video span) are prepared and committed at once.
+    public var mediaWindowsPerStep = 12
     public var excludedFolders: [String] = []
     public var excludedExtensions: Set<String> = []
 
@@ -82,6 +84,16 @@ public struct IndexOptions: Sendable {
         // number, and every code index is read again.
         if code { return "code1 lines\(codeStretch)" }
         return "photo\(photoBudget) shot\(screenshotBudget) page\(pageBudget) frame\(frameBudget)/\(frameInterval)s audio\(audioWindow)/\(audioHop)s"
+    }
+
+    /// Extraction policy is independent of vector compatibility. Changing it rebuilds only the affected file kinds.
+    var extractionPolicies: [String: String] {
+        if code { return ["code": "code2 bytes\(maxCodeBytes) notebook\(maxNotebookBytes)"] }
+        return [
+            "image": "image1 min\(minImageSide)", "screenshot": "image1 min\(minImageSide)",
+            "pdf": "pdf1 max\(maxPages) text\(minPageText)", "doc": "doc1 max\(maxChunks)",
+            "audio": "media1 step\(mediaWindowsPerStep)", "video": "media1 step\(mediaWindowsPerStep)",
+        ]
     }
 }
 

@@ -9,12 +9,21 @@ extension AudioExtractor {
     /// Decodes audio (a file, or a video's soundtrack) to 16 kHz mono and writes `window`-second WAV pieces `hop`
     /// seconds apart, skipping silent ones. One model input ignores anything past 30 s, so windows stay ≤ 30 s.
     /// Streams: memory stays at one window, even for a 3-hour podcast.
-    static func windows(of url: URL, window: Double, hop: Double, minimum: Double = 2, to folder: URL) async throws
+    static func windows(of url: URL, window: Double, hop: Double, minimum: Double = 2,
+                        range: Range<Double>? = nil, to folder: URL) async throws
         -> (pieces: [MediaPiece], duration: Double) {
         let asset = AVURLAsset(url: url)
         guard let track = try await asset.loadTracks(withMediaType: .audio).first else { return ([], 0) }
         let duration = try await asset.load(.duration).seconds
+        guard window > 0, hop > 0, hop <= window else { throw ExtractError.unreadable("invalid audio window/hop") }
         let reader = try AVAssetReader(asset: asset)
+        let begin = max(0, range?.lowerBound ?? 0)
+        let end = min(duration, range?.upperBound ?? duration)
+        if range != nil {
+            reader.timeRange = CMTimeRange(start: CMTime(seconds: begin, preferredTimescale: 16_000),
+                                           duration: CMTime(seconds: max(0, min(duration, end + window - hop) - begin),
+                                                            preferredTimescale: 16_000))
+        }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
@@ -25,9 +34,10 @@ extension AudioExtractor {
 
         let windowSamples = Int(window * sampleRate), hopSamples = Int(hop * sampleRate)
         var buffer: [Int16] = []
-        var offset = 0   // sample index of buffer[0] in the file
+        var offset = Int(begin * sampleRate)   // sample index of buffer[0] in the file
         var pieces: [MediaPiece] = []
         func emit(_ count: Int) throws {
+            guard Double(offset) / sampleRate < end else { return }
             let slice = buffer[0..<count]
             guard rms(slice) > 0.003 else { return }   // ≈ −50 dBFS: silence isn't worth a vector
             let out = folder.appendingPathComponent(UUID().uuidString + ".wav")
@@ -50,7 +60,7 @@ extension AudioExtractor {
         }
         if reader.status == .failed { throw reader.error ?? ExtractError.unreadable("audio decoding failed") }
         // The tail: new audio beyond the previous window's overlap, or the whole file if it was shorter than a window.
-        let alreadyCovered = offset == 0 ? 0 : windowSamples - hopSamples
+        let alreadyCovered = offset == Int(begin * sampleRate) ? 0 : windowSamples - hopSamples
         if buffer.count - alreadyCovered >= Int(minimum * sampleRate) { try emit(buffer.count) }
         return (pieces, duration.isFinite ? duration : Double(offset + buffer.count) / sampleRate)
     }
@@ -60,7 +70,8 @@ extension VideoExtractor {
     /// Samples a frame every `interval` seconds and keeps one per shot: a frame that looks like the previous kept one
     /// (8×8 average hash within 4 bits) only extends it. Screen recordings and lectures shrink a lot.
     /// Google's Video Moments Finder also matches queries against per-frame vectors.
-    static func keyframes(of url: URL, every interval: Double, maxPixel: Int, maxFrames: Int = 1200, to folder: URL)
+    static func keyframes(of url: URL, every interval: Double, maxPixel: Int, maxFrames: Int = 1200,
+                          range: Range<Double>? = nil, to folder: URL)
         async throws -> (frames: [MediaPiece], duration: Double, hasAudio: Bool) {
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds
@@ -72,10 +83,14 @@ extension VideoExtractor {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        let tolerance = CMTime(seconds: step / 2, preferredTimescale: 600)
+        // A bounded checkpoint must not borrow a keyframe from the following checkpoint and then discard it.
+        let tolerance = range == nil ? CMTime(seconds: step / 2, preferredTimescale: 600) : CMTime.zero
         generator.requestedTimeToleranceBefore = tolerance
         generator.requestedTimeToleranceAfter = tolerance
-        let times = stride(from: min(0.5, duration / 2), to: duration, by: step).map {
+        let begin = max(0, range?.lowerBound ?? 0), end = min(duration, range?.upperBound ?? duration)
+        let first = min(0.5, duration / 2)
+        let selectedFirst = first + max(0, ceil((begin - first) / step)) * step
+        let times = stride(from: selectedFirst, to: end, by: step).map {
             CMTime(seconds: $0, preferredTimescale: 600)
         }
 
@@ -83,12 +98,13 @@ extension VideoExtractor {
         var lastHash: UInt64?
         for await result in generator.images(for: times) {
             guard case let .success(_, image, actualTime) = result else { continue }
+            guard actualTime.seconds < end else { continue }
             let hash = averageHash(image)
             if let lastHash, (hash ^ lastHash).nonzeroBitCount <= 4 { continue }
             lastHash = hash
             let out = folder.appendingPathComponent(UUID().uuidString + ".jpg")
             try ImageExtractor.write(image, to: out, png: false)
-            frames.append(MediaPiece(path: out.path, start: max(0, actualTime.seconds), end: duration))
+            frames.append(MediaPiece(path: out.path, start: max(begin, min(end, actualTime.seconds)), end: end))
         }
         // Each kept frame stands for the stretch until the next kept frame.
         for index in frames.indices.dropLast() { frames[index].end = frames[index + 1].start }

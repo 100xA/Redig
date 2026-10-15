@@ -38,9 +38,21 @@ nonisolated final class FolderWatcher: @unchecked Sendable {
 
     fileprivate func received(_ paths: [String]) {
         let relevant = paths.filter { path in
-            !path.split(separator: "/").contains { $0.hasPrefix(".") }
+            Self.isPolicyChange(path) || !path.split(separator: "/").contains { $0.hasPrefix(".") }
         }
         if !relevant.isEmpty { handler(relevant) }
+    }
+
+    /// These hidden files change what may be indexed. Their contents are never indexed themselves.
+    static func isPolicyChange(_ path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent
+        return name == ".gitignore" || name == ".git" || path.hasSuffix("/.git/info/exclude")
+    }
+
+    static func policyScope(of path: String) -> String? {
+        if path.hasSuffix("/.git/info/exclude") { return String(path.dropLast("/.git/info/exclude".count)) }
+        guard isPolicyChange(path) else { return nil }
+        return (path as NSString).deletingLastPathComponent
     }
 }
 

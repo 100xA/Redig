@@ -79,15 +79,20 @@ extension AudioExtractor {
     /// Decodes audio (a file, or a video's soundtrack) to 16 kHz mono through ffmpeg and writes `window`-second WAV
     /// pieces `hop` seconds apart, skipping silent ones; one model input ignores anything past 30 s, so windows stay
     /// ≤ 30 s. Streams: memory stays at one window, even for a 3-hour podcast.
-    static func windows(of url: URL, window: Double, hop: Double, minimum: Double = 2, to folder: URL) async throws
+    static func windows(of url: URL, window: Double, hop: Double, minimum: Double = 2,
+                        range: Range<Double>? = nil, to folder: URL) async throws
         -> (pieces: [MediaPiece], duration: Double) {
         guard MediaInfo.streams(of: url).audio else { return ([], 0) }
         let duration = MediaInfo.duration(of: url) ?? 0
+        guard window > 0, hop > 0, hop <= window else { throw ExtractError.unreadable("invalid audio window/hop") }
+        let begin = max(0, range?.lowerBound ?? 0)
+        let end = range?.upperBound ?? (duration > 0 ? duration : .infinity)
         let windowSamples = Int(window * sampleRate), hopSamples = Int(hop * sampleRate)
         var buffer: [Int16] = []
-        var offset = 0   // sample index of buffer[0] in the file
+        var offset = Int(begin * sampleRate)   // sample index of buffer[0] in the file
         var pieces: [MediaPiece] = []
         func emit(_ count: Int) throws {
+            guard Double(offset) / sampleRate < end else { return }
             let slice = buffer[0..<count]
             guard rms(slice) > 0.003 else { return }   // ≈ −50 dBFS: silence isn't worth a vector
             let out = folder.appendingPathComponent(UUID().uuidString + ".wav")
@@ -96,8 +101,10 @@ extension AudioExtractor {
                                      end: Double(offset + count) / sampleRate))
         }
         var odd: UInt8?   // a byte left over when a read ends mid-sample
-        try FFmpeg.run(FFmpeg.ffmpeg, ["-v", "error", "-nostdin", "-i", url.path, "-vn", "-ac", "1", "-ar",
-                                       "\(Int(sampleRate))", "-f", "s16le", "-"]) { data in
+        let selection = range.map { _ in ["-ss", String(begin)] } ?? []
+        let length = range.map { _ in ["-t", String(max(0, end + window - hop - begin))] } ?? []
+        try FFmpeg.run(FFmpeg.ffmpeg, ["-v", "error", "-nostdin"] + selection + ["-i", url.path] + length
+            + ["-vn", "-ac", "1", "-ar", "\(Int(sampleRate))", "-f", "s16le", "-"]) { data in
             var bytes: [UInt8] = []
             bytes.reserveCapacity(data.count + 1)
             if let first = odd { bytes.append(first); odd = nil }
@@ -116,7 +123,7 @@ extension AudioExtractor {
             }
         }
         // The tail: new audio beyond the previous window's overlap, or the whole file if it was shorter than a window.
-        let alreadyCovered = offset == 0 ? 0 : windowSamples - hopSamples
+        let alreadyCovered = offset == Int(begin * sampleRate) ? 0 : windowSamples - hopSamples
         if buffer.count - alreadyCovered >= Int(minimum * sampleRate) { try emit(buffer.count) }
         return (pieces, duration > 0 ? duration : Double(offset + buffer.count) / sampleRate)
     }
@@ -125,20 +132,26 @@ extension AudioExtractor {
 extension VideoExtractor {
     /// Samples a frame every `interval` seconds through ffmpeg and keeps one per shot: a frame that looks like the
     /// previous kept one (8×8 average hash within 4 bits) only extends it.
-    static func keyframes(of url: URL, every interval: Double, maxPixel: Int, maxFrames: Int = 1200, to folder: URL)
+    static func keyframes(of url: URL, every interval: Double, maxPixel: Int, maxFrames: Int = 1200,
+                          range: Range<Double>? = nil, to folder: URL)
         async throws -> (frames: [MediaPiece], duration: Double, hasAudio: Bool) {
         let streams = MediaInfo.streams(of: url)
         let duration = MediaInfo.duration(of: url) ?? 0
         guard duration > 0, streams.video else { return ([], duration, streams.audio) }
         let step = max(interval, duration / Double(maxFrames))
-        let first = min(0.5, duration / 2)
+        let origin = min(0.5, duration / 2)
+        let begin = max(0, range?.lowerBound ?? 0), end = min(duration, range?.upperBound ?? duration)
+        let first = origin + max(0, ceil((begin - origin) / step)) * step
+        let seek = range == nil ? 0 : max(0, begin - 12)
+        let selection = range == nil ? [] : ["-ss", String(seek), "-t", String(end - seek)]
+        let trim = range == nil ? "" : "trim=start=\(begin - seek):end=\(end - seek),setpts=PTS-STARTPTS,"
         let prefix = "frame-\(UUID().uuidString)-"
         // Frame n is the one shown at first + n * step: fps's slots start at `first`, and round=up gives each slot the
         // last frame at or before it (its default gives the last before the slot's middle, half a step later). Every
         // frame is decoded anyway, so reading from the start costs nothing over seeking to `first`, and an MPEG-TS has
         // no index: a seek there lands past the keyframe, and nothing decodes until the next one.
-        try FFmpeg.run(FFmpeg.ffmpeg, ["-v", "error", "-nostdin", "-i", url.path, "-an", "-vf",
-                                       "fps=fps=\(1 / step):start_time=\(first):round=up,"
+        try FFmpeg.run(FFmpeg.ffmpeg, ["-v", "error", "-nostdin"] + selection + ["-i", url.path, "-an", "-vf",
+                                       trim + "fps=fps=\(1 / step):start_time=\(first - begin):round=up,"
                                        + "scale=\(maxPixel):\(maxPixel):force_original_aspect_ratio=decrease",
                                        "-q:v", "3", "-f", "image2", folder.appendingPathComponent(prefix + "%06d.jpg").path]) { _ in }
         let names = try FileManager.default.contentsOfDirectory(atPath: folder.path).filter { $0.hasPrefix(prefix) }.sorted()
@@ -147,7 +160,7 @@ extension VideoExtractor {
         for (index, name) in names.enumerated() {
             let path = folder.appendingPathComponent(name).path
             let start = first + Double(index) * step
-            guard start < duration else {   // fps can fill a slot past the end
+            guard start < end else {   // fps can fill a slot past the end
                 try? FileManager.default.removeItem(atPath: path)
                 continue
             }
@@ -159,7 +172,7 @@ extension VideoExtractor {
                 }
                 lastHash = hash
             }
-            frames.append(MediaPiece(path: path, start: start, end: duration))
+            frames.append(MediaPiece(path: path, start: start, end: end))
         }
         // Each kept frame stands for the stretch until the next kept frame.
         for index in frames.indices.dropLast() { frames[index].end = frames[index + 1].start }

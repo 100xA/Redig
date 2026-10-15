@@ -28,7 +28,8 @@ final class VectorStorage {
     private let bytes: Int
 
     init?(rows: Int) {
-        guard rows > 0 else { return nil }
+        guard rows > 0, rows <= (Int.max - Self.blockRows * Vectors.dimension * MemoryLayout<Float>.stride)
+                / (Vectors.dimension * MemoryLayout<Float16>.stride) else { return nil }
         let halfBytes = rows * Vectors.dimension * MemoryLayout<Float16>.stride
         let blockBytes = Self.blockRows * Vectors.dimension * MemoryLayout<Float>.stride
         bytes = halfBytes + blockBytes

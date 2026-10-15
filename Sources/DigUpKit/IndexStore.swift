@@ -20,7 +20,7 @@ public struct FileRecord: Sendable {
 public final class IndexStore {
     public let directory: URL
     public let db: Database
-    static let schemaVersion: Int64 = 5
+    static let schemaVersion: Int64 = 6
 
     /// Keyword search's tokenizer. Marks (M*) count as letters, so Bengali vowel signs and Arabic harakat stay inside
     /// their words: by default SQLite splits on them ("কলকাতায়" became "কলক", "ত", "য").
@@ -101,14 +101,24 @@ public final class IndexStore {
             if (1...2).contains(version) { try migrateScreenshotText() }
             if (1...3).contains(version) { try migrateVectorNames() }
             if (1...4).contains(version) { try migrateLongFiles() }
+            if (1...5).contains(version) { try migrateSearchSnapshots() }
         }
     }
 
     private func create() throws {
+        try db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        try createFileTables()
         try db.execute("""
-            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE VIRTUAL TABLE fts USING fts5(\(Self.ftsColumns));
+            PRAGMA user_version = \(Self.schemaVersion);
+            """)
+        try createSearchJournal()
+    }
+
+    private func createFileTables() throws {
+        try db.execute("""
             CREATE TABLE files(
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 path TEXT NOT NULL UNIQUE,
                 kind TEXT NOT NULL,
                 size INTEGER NOT NULL,
@@ -123,7 +133,7 @@ public final class IndexStore {
             CREATE INDEX files_inode ON files(device, inode);
             CREATE INDEX files_state ON files(state, kind);
             CREATE TABLE segments(
-                id INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL,       -- SegmentKind
                 modality TEXT NOT NULL,   -- Modality of the vector ('none' when there is no vector)
@@ -133,8 +143,7 @@ public final class IndexStore {
                 vec BLOB                  -- 768 × float16, L2-normalized
             );
             CREATE INDEX segments_file ON segments(file);
-            CREATE VIRTUAL TABLE fts USING fts5(\(Self.ftsColumns));
-            PRAGMA user_version = \(Self.schemaVersion);
+            CREATE INDEX segments_search ON segments(id, file);
             """)
     }
 
@@ -203,6 +212,102 @@ public final class IndexStore {
             PRAGMA user_version = 5;
             """)
     }
+    /// IDs are never reused: an in-memory vector can never be hydrated as an unrelated replacement file.
+    /// The small covering index keeps FTS lookups off the table's large vector blobs.
+    private func migrateSearchSnapshots() throws {
+        // Older-schema migration fixtures can deliberately lower user_version on a current index. Its structural
+        // migration is already complete; preserve the live triggers and monotonically increasing sequences.
+        var currentTables = 0, journalExists = false
+        try db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name IN ('files', 'segments')") {
+            if $0.text(0)?.uppercased().contains("AUTOINCREMENT") == true { currentTables += 1 }
+        }
+        try db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_state'") { _ in journalExists = true }
+        if currentTables == 2, journalExists { try db.execute("PRAGMA user_version = 6"); return }
+        try db.execute("""
+            ALTER TABLE segments RENAME TO segments_old;
+            ALTER TABLE files RENAME TO files_old;
+            DROP INDEX IF EXISTS files_inode;
+            DROP INDEX IF EXISTS files_state;
+            DROP INDEX IF EXISTS segments_file;
+            DROP INDEX IF EXISTS segments_search;
+            """)
+        try createFileTables()
+        try db.execute("""
+            INSERT INTO files SELECT * FROM files_old;
+            INSERT INTO segments SELECT * FROM segments_old;
+            DROP TABLE segments_old;
+            DROP TABLE files_old;
+            PRAGMA user_version = 6;
+            """)
+        try createSearchJournal()
+    }
+
+    /// One entry per changed file, including deleted ones. Trigger writes commit with the indexed content, so readers
+    /// can refresh after any writer (including the CLI). Old history is bounded; lagging readers take a full snapshot.
+    private func createSearchJournal() throws {
+        try db.execute("""
+            CREATE TABLE search_state(id INTEGER PRIMARY KEY CHECK(id = 1), generation INTEGER NOT NULL, floor INTEGER NOT NULL);
+            INSERT INTO search_state VALUES(1, 0, 0);
+            CREATE TABLE search_changes(file INTEGER PRIMARY KEY, generation INTEGER NOT NULL, vector_generation INTEGER NOT NULL);
+            CREATE INDEX search_changes_generation ON search_changes(generation);
+            CREATE TRIGGER search_history AFTER UPDATE OF generation ON search_state
+            WHEN NEW.generation % 4096 = 0 BEGIN
+                UPDATE search_state SET floor = MAX(floor, NEW.generation - 65536) WHERE id = 1;
+                DELETE FROM search_changes WHERE generation < NEW.generation - 65536;
+            END;
+            """)
+        for (table, file, vector) in [("files", "id", false), ("segments", "file", true)] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                let record = operation == "DELETE" ? "OLD" : "NEW"
+                let vectorGeneration = vector ? "generation" : "0"
+                // A file's kind/info controls which vectors set the scale, so metadata-only changes still refresh its
+                // row flags below. vector_generation records changes that actually require reading vector blobs.
+                try db.execute("""
+                    CREATE TRIGGER search_\(table)_\(operation.lowercased()) AFTER \(operation) ON \(table) BEGIN
+                        UPDATE search_state SET generation = generation + 1 WHERE id = 1;
+                        INSERT INTO search_changes(file, generation, vector_generation)
+                            SELECT \(record).\(file), generation, \(vectorGeneration) FROM search_state WHERE id = 1
+                            ON CONFLICT(file) DO UPDATE SET generation = excluded.generation,
+                                vector_generation = MAX(search_changes.vector_generation, excluded.vector_generation);
+                    END;
+                    """)
+                if table == "segments", operation == "UPDATE" {
+                    try db.execute("""
+                        CREATE TRIGGER search_segments_move AFTER UPDATE OF file ON segments WHEN OLD.file != NEW.file BEGIN
+                            UPDATE search_state SET generation = generation + 1 WHERE id = 1;
+                            INSERT INTO search_changes(file, generation, vector_generation)
+                                SELECT OLD.file, generation, generation FROM search_state WHERE id = 1
+                                ON CONFLICT(file) DO UPDATE SET generation = excluded.generation,
+                                    vector_generation = excluded.vector_generation;
+                        END;
+                        """)
+                }
+            }
+        }
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let record = operation == "DELETE" ? "OLD" : "NEW"
+            try db.execute("""
+                CREATE TRIGGER search_meta_\(operation.lowercased()) AFTER \(operation) ON meta
+                WHEN \(record).key IN ('vector_source', 'fingerprint') BEGIN
+                    UPDATE search_state SET generation = generation + 1 WHERE id = 1;
+                END;
+                """)
+        }
+    }
+
+    struct SearchGeneration {
+        let current: Int64
+        let floor: Int64
+    }
+
+    func searchGeneration() throws -> SearchGeneration {
+        var value = SearchGeneration(current: 0, floor: 0)
+        try db.query("SELECT generation, floor FROM search_state WHERE id = 1") {
+            value = SearchGeneration(current: $0.int(0), floor: $0.int(1))
+        }
+        return value
+    }
+
     // MARK: Meta
 
     public func meta(_ key: String) throws -> String? {
@@ -250,44 +355,69 @@ public final class IndexStore {
     /// Adds a file (pending) and returns its id.
     @discardableResult
     public func insert(_ file: Candidate) throws -> Int64 {
-        try db.run("INSERT INTO files(path, kind, size, mtime, inode, device) VALUES(?, ?, ?, ?, ?, ?)",
-                   [.text(file.path), .text(file.kind.rawValue), .int(file.size), .double(file.mtime),
-                    .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device))])
-        let id = db.lastInsertID
-        try addNameRow(file: id, path: file.path)
-        return id
+        return try db.transaction {
+            try db.run("INSERT INTO files(path, kind, size, mtime, inode, device) VALUES(?, ?, ?, ?, ?, ?)",
+                       [.text(file.path), .text(file.kind.rawValue), .int(file.size), .double(file.mtime),
+                        .int(Int64(bitPattern: file.inode)), .int(Int64(bitPattern: file.device))])
+            let id = db.lastInsertID
+            try addNameRow(file: id, path: file.path)
+            return id
+        }
     }
 
     /// The file changed on disk: drop what was extracted from it and queue it again.
     public func requeue(_ id: Int64, as file: Candidate) throws {
-        try deleteSegments(of: id, keepingName: true)
-        try db.run("""
-            UPDATE files SET kind = ?, size = ?, mtime = ?, inode = ?, device = ?, state = 'pending', detail = NULL,
-                info = NULL, indexed_at = NULL WHERE id = ?
-            """, [.text(file.kind.rawValue), .int(file.size), .double(file.mtime), .int(Int64(bitPattern: file.inode)),
-                  .int(Int64(bitPattern: file.device)), .int(id)])
+        try db.transaction {
+            try deleteSegments(of: id, keepingName: true)
+            try db.run("""
+                UPDATE files SET kind = ?, size = ?, mtime = ?, inode = ?, device = ?, state = 'pending', detail = NULL,
+                    info = NULL, indexed_at = NULL WHERE id = ?
+                """, [.text(file.kind.rawValue), .int(file.size), .double(file.mtime), .int(Int64(bitPattern: file.inode)),
+                      .int(Int64(bitPattern: file.device)), .int(id)])
+        }
     }
 
     /// Extract and embed the file again, as it is (after a better way to read it arrived).
     func requeue(_ id: Int64) throws {
-        try deleteSegments(of: id, keepingName: true)
-        try db.run("UPDATE files SET state = 'pending', detail = NULL, info = NULL, indexed_at = NULL WHERE id = ?",
-                   [.int(id)])
+        try db.transaction {
+            try deleteSegments(of: id, keepingName: true)
+            try db.run("UPDATE files SET state = 'pending', detail = NULL, info = NULL, indexed_at = NULL WHERE id = ?",
+                       [.int(id)])
+        }
+    }
+
+    /// Re-read only these kinds after an extraction rule changes; other content and name search are preserved.
+    @discardableResult
+    public func requeue(kinds: Set<FileKind>) throws -> Int {
+        guard !kinds.isEmpty else { return 0 }
+        return try db.transaction {
+            var ids: [Int64] = []
+            let values = kinds.map { SQLValue.text($0.rawValue) }
+            try db.query("SELECT id FROM files WHERE kind IN (\(values.map { _ in "?" }.joined(separator: ",")))", values) {
+                ids.append($0.int(0))
+            }
+            for id in ids { try requeue(id) }
+            return ids.count
+        }
     }
 
     /// Same inode, size and date at a new path: a move or rename. Only the path changes; nothing is re-embedded.
     /// (Screenshot tools move screenshots into project folders all the time.)
     public func move(_ id: Int64, to path: String) throws {
-        try db.run("UPDATE files SET path = ? WHERE id = ?", [.text(path), .int(id)])
-        try db.run("""
-            UPDATE fts SET name = ?, body = ? WHERE rowid IN (SELECT id FROM segments WHERE file = ? AND kind = 'name')
-            """, [.text(SearchText.normalized(Self.nameText(path))), .text(SearchText.normalized(Self.folderText(path))),
-                  .int(id)])
+        try db.transaction {
+            try db.run("UPDATE files SET path = ? WHERE id = ?", [.text(path), .int(id)])
+            try db.run("""
+                UPDATE fts SET name = ?, body = ? WHERE rowid IN (SELECT id FROM segments WHERE file = ? AND kind = 'name')
+                """, [.text(SearchText.normalized(Self.nameText(path))), .text(SearchText.normalized(Self.folderText(path))),
+                      .int(id)])
+        }
     }
 
     public func delete(_ id: Int64) throws {
-        try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE file = ?)", [.int(id)])
-        try db.run("DELETE FROM files WHERE id = ?", [.int(id)])
+        try db.transaction {
+            try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE file = ?)", [.int(id)])
+            try db.run("DELETE FROM files WHERE id = ?", [.int(id)])
+        }
     }
 
     /// Removes every file that isn't under one of `roots` (folders taken out of the app). Returns how many went.
@@ -427,13 +557,15 @@ public final class IndexStore {
     /// Adds a segment; `text` goes into keyword search (normalized, see `SearchText`), `vector` into meaning search.
     public func addSegment(file: Int64, kind: SegmentKind, modality: Modality, loc: Double? = nil, locEnd: Double? = nil,
                            excerpt: String? = nil, text: String? = nil, vector: [Float]? = nil) throws {
-        try db.run("INSERT INTO segments(file, kind, modality, loc, loc_end, excerpt, vec) VALUES(?, ?, ?, ?, ?, ?, ?)",
-                   [.int(file), .text(kind.rawValue), .text(vector == nil ? Modality.none.rawValue : modality.rawValue),
-                    .optional(loc), .optional(locEnd), .optional(excerpt),
-                    vector.map { .blob(Vectors.half($0)) } ?? .null])
-        if let text, !text.isEmpty {
-            try db.run("INSERT INTO fts(rowid, name, body, original) VALUES(?, '', ?, ?)",
-                       [.int(db.lastInsertID)] + Self.keywordText(text))
+        try db.transaction {
+            try db.run("INSERT INTO segments(file, kind, modality, loc, loc_end, excerpt, vec) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                       [.int(file), .text(kind.rawValue), .text(vector == nil ? Modality.none.rawValue : modality.rawValue),
+                        .optional(loc), .optional(locEnd), .optional(excerpt),
+                        vector.map { .blob(Vectors.half($0)) } ?? .null])
+            if let text, !text.isEmpty {
+                try db.run("INSERT INTO fts(rowid, name, body, original) VALUES(?, '', ?, ?)",
+                           [.int(db.lastInsertID)] + Self.keywordText(text))
+            }
         }
     }
 
@@ -454,6 +586,19 @@ public final class IndexStore {
         let filter = keepingName ? "AND kind != 'name'" : ""
         try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE file = ? \(filter))", [.int(file)])
         try db.run("DELETE FROM segments WHERE file = ? \(filter)", [.int(file)])
+    }
+
+    /// Remove a retry window before replacing it in the same transaction. Locations are inclusive; name rows stay.
+    public func deleteSegments(of file: Int64, kind: SegmentKind? = nil, from: Double? = nil,
+                               through: Double? = nil) throws {
+        var filter = "file = ? AND kind != 'name'", values: [SQLValue] = [.int(file)]
+        if let kind { filter += " AND kind = ?"; values.append(.text(kind.rawValue)) }
+        if let from { filter += " AND loc >= ?"; values.append(.double(from)) }
+        if let through { filter += " AND loc <= ?"; values.append(.double(through)) }
+        try db.transaction {
+            try db.run("DELETE FROM fts WHERE rowid IN (SELECT id FROM segments WHERE \(filter))", values)
+            try db.run("DELETE FROM segments WHERE \(filter)", values)
+        }
     }
 
     /// "Screenshot 2026-10-01 at 9.41.07 PM.png" → searchable words.

@@ -62,6 +62,7 @@ public final class Indexer {
             .appendingPathComponent("DigUp-\(ProcessInfo.processInfo.processIdentifier)")
             .appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        preparationCache.documentFolder = scratch.appendingPathComponent("documents")
     }
 
     deinit {
@@ -88,13 +89,15 @@ public final class Indexer {
     /// Crawls `roots` and reconciles the index: new files are queued, changed ones re-queued, moved ones re-pathed
     /// (no re-embedding), and files that are gone or newly excluded are removed.
     public func sync(_ roots: [URL]) throws -> SyncSummary {
+        let spellings = roots.map { ($0.path, FolderSelection.realPath($0.path)) }
         let crawl = Crawler.crawl(roots, options: options)
+        preparing.sync { preparationCache.discovery = CodeExtractor.DiscoveryCache() }
         let existing = try store.files(under: roots.map { $0.standardizedFileURL.path })
         var byPath: [String: FileRecord] = [:]
         var byInode: [String: FileRecord] = [:]
         for file in existing {
             byPath[file.path] = file
-            byInode["\(file.device):\(file.inode)"] = file
+            if file.inode != 0 { byInode["\(file.device):\(file.inode)"] = file }
         }
         let seen = Set(crawl.candidates.map(\.path))
         var movedFrom = Set<String>()
@@ -102,7 +105,9 @@ public final class Indexer {
         try store.db.transaction {
             for file in crawl.candidates {
                 if let row = byPath[file.path] {
-                    if row.size != file.size || abs(row.mtime - file.mtime) > 0.001 || row.kind != file.kind {
+                    if row.size != file.size || abs(row.mtime - file.mtime) > 0.000001 || row.kind != file.kind
+                        || (row.inode != 0 && file.inode != 0 && (row.inode != file.inode || row.device != file.device))
+                        || row.state == "unavailable" {
                         try store.requeue(row.id, as: file)
                         summary.changed += 1
                         summary.queued.append(row.id)
@@ -110,7 +115,8 @@ public final class Indexer {
                         summary.unchanged += 1
                     }
                 } else if let row = byInode["\(file.device):\(file.inode)"], !seen.contains(row.path),
-                          !movedFrom.contains(row.path), row.size == file.size, abs(row.mtime - file.mtime) < 0.001 {
+                          !movedFrom.contains(row.path), row.kind == file.kind, row.size == file.size,
+                          abs(row.mtime - file.mtime) < 0.000001 {
                     try store.move(row.id, to: file.path)
                     movedFrom.insert(row.path)
                     summary.moved += 1
@@ -121,10 +127,10 @@ public final class Indexer {
             }
             // A root that went away while it was being walked (a drive ejected mid-crawl) looked emptier than it is:
             // keep its rows rather than take that for "deleted".
-            let vanished = roots.map { $0.standardizedFileURL.path }
-                .filter { !FileManager.default.fileExists(atPath: $0) }.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+            let unavailable = crawl.unavailable + spellings.filter { !FileManager.default.fileExists(atPath: $0.0) }
+                .flatMap { [$0.0, $0.1] }
             for row in existing where !seen.contains(row.path) && !movedFrom.contains(row.path)
-                && !vanished.contains(where: { row.path.hasPrefix($0) }) {
+                && !unavailable.contains(where: { row.path == $0 || FolderSelection.isInside(row.path, $0) }) {
                 try store.delete(row.id)
                 summary.removed += 1
             }
@@ -142,6 +148,7 @@ public final class Indexer {
     @discardableResult
     public func run(limit: Int? = nil, only ids: Set<Int64>? = nil, shouldStop: () -> Bool = { false },
                     onEvent: (Event) -> Void = { _ in }) throws -> [String: Int] {
+        try checkModel()
         let queue = try store.pending(limit: limit, only: ids)
         var states: [String: Int] = [:]
         var done = 0
@@ -177,17 +184,23 @@ public final class Indexer {
     @discardableResult
     public func finishLongFiles(shouldStop: () -> Bool = { false }, onStep: (Step) -> Void = { _ in }) throws
         -> [String: Int] {
+        try checkModel()
         var jobs: [Job] = []
         for file in try store.unfinished() {
             let info = try store.info(of: file.id)
-            let size = file.kind == .pdf ? options.pdfStep : options.docStep
+            let size: Int
+            switch file.kind {
+            case .pdf: size = options.pdfStep
+            case .audio, .video: size = options.mediaWindowsPerStep
+            default: size = options.docStep
+            }
             // Where it stopped (after the last page or chunk stored, should its info not say; nothing stored: the start).
             var start = try info["read_to"].flatMap(Int.init) ?? store.lastPlace(of: file.id) ?? 0
             // At least one step, which settles a file whose length was only guessed (documents cut before schema 5).
             let end = max(info["read_end"].flatMap(Int.init) ?? 0, start + 1)
             while start < end {
-                jobs.append(Job(files: [file], step: start..<min(start + size, end)))
-                start += size
+                jobs.append(Job(files: [file], step: start..<min(start + max(1, size), end)))
+                start += max(1, size)
             }
         }
         // Progress counts pages and chunks: what's read once each job is through.
@@ -221,10 +234,10 @@ public final class Indexer {
     private func process(_ jobs: [Job], shouldStop: () -> Bool,
                          committed: (Int, Job, [(String, String?)], Double) -> Void,
                          skip: (Job) -> Bool = { _ in false }) throws {
-        var ahead: PendingBatch?
+        var ahead: (index: Int, batch: PendingBatch)?
         defer {
             // A job prepared for a run that stopped early: throw its files away.
-            if let ahead { try? FileManager.default.removeItem(at: ahead.wait().folder) }
+            if let ahead { try? FileManager.default.removeItem(at: ahead.batch.wait().folder) }
             if let costsFolder, !measured.tallies.isEmpty {
                 MeasuredCosts.merge(measured, into: costsFolder)
                 measured = MeasuredCosts()
@@ -232,15 +245,31 @@ public final class Indexer {
         }
         for (index, job) in jobs.enumerated() {
             guard !shouldStop() else { break }
+            if skip(job) {
+                if let pending = ahead, pending.index == index {
+                    try? FileManager.default.removeItem(at: pending.batch.wait().folder)
+                    ahead = nil
+                }
+                continue
+            }
             let started = Date()
-            let prepared = (ahead ?? prepare(job)).wait()
-            ahead = index + 1 < jobs.count ? prepare(jobs[index + 1]) : nil
+            let prepared = (ahead?.batch ?? prepare(job)).wait()
+            ahead = nil
+            // A file can have finished sooner than its preplanned steps. Do not read the skipped jobs at all.
+            if let next = jobs.indices.dropFirst(index + 1).first(where: { !skip(jobs[$0]) }) {
+                ahead = (next, prepare(jobs[next]))
+            }
             defer { try? FileManager.default.removeItem(at: prepared.folder) }
-            guard !skip(job) else { continue }
             // The helper's and the CLI's main thread has no run loop to drain what Foundation autoreleases while a job
             // commits: without a pool per job it all stayed until the process exited (~30 KB a text chunk).
             let modelWasRunning = worker != nil
-            let results = try autoreleasepool { try commit(prepared) }
+            let results: [(String, String?)]
+            do {
+                results = try autoreleasepool { try commit(prepared) }
+            } catch is SourceChanged {
+                for file in job.files { try refreshChanged(file) }
+                results = job.files.map { _ in ("pending", "source changed; queued again") }
+            }
             let seconds = Date().timeIntervalSince(started)
             if modelWasRunning { measure(prepared, seconds: seconds) }   // else it's seconds of the model starting
             committed(index, job, results, seconds / Double(job.files.count))
@@ -258,8 +287,8 @@ public final class Indexer {
             // what a chunk of prose costs (the estimate can't tell them apart from a file's size).
             let worded = chunks.filter(SearchText.hasWords).count
             if worded > 0 { measured.add("docChunk", units: Double(worded), seconds: seconds) }
-        case .audio(_, let duration): measured.add("audioSecond", units: duration, seconds: seconds)
-        case .video(_, _, let duration): measured.add("videoSecond", units: duration, seconds: seconds)
+        case .audio(_, let duration, let read): measured.add("audioSecond", units: min(Double(read.count) * options.audioHop, max(0, duration - Double(read.lowerBound) * options.audioHop)), seconds: seconds)
+        case .video(_, _, let duration, let read): measured.add("videoSecond", units: min(Double(read.count) * options.audioHop, max(0, duration - Double(read.lowerBound) * options.audioHop)), seconds: seconds)
         case .code(let file): measured.add("codeStretch", units: Double(file.pieces.count), seconds: seconds)
         case .nothing: break
         }
@@ -294,8 +323,19 @@ public final class Indexer {
     /// change empties the index (see `resetOnModelChange`) or throws `fingerprintMismatch`. Without a known source the
     /// check waits for the first file to embed.
     public func checkModel() throws {
-        guard let embedderSource else { return }
-        try adopt("\(embedderSource) | \(options.fingerprint)")
+        if let embedderSource { try adopt("\(embedderSource) | \(options.fingerprint)") }
+        var legacy = IndexOptions()
+        legacy.code = options.code
+        for (kind, policy) in options.extractionPolicies {
+            let key = "extraction_\(kind)"
+            // Old indexes predate policy metadata. Code discovery/eligibility changed in this fork: revisit it once.
+            let predecessor = kind == "code" ? "code1" : legacy.extractionPolicies[kind]
+            let previous = try store.meta(key) ?? predecessor
+            if previous != policy, let fileKind = FileKind(rawValue: kind) {
+                _ = try store.requeue(kinds: [fileKind])
+            }
+            try store.setMeta(key, policy)
+        }
     }
 
     private func adopt(_ fingerprint: String) throws {
@@ -338,6 +378,40 @@ public final class Indexer {
         let detail: String?
     }
 
+    private struct SourceChanged: Error {}
+
+    private static func isCurrent(_ file: FileRecord) -> Bool {
+        guard let now = FileSystem.info(of: file.path), now.isRegular, !now.dataless else { return false }
+        let values = try? URL(fileURLWithPath: file.path).resourceValues(forKeys: Set(FileSystem.crawlKeys))
+        return !FileSystem.isInCloud(values) && now.size == file.size && abs(now.mtime - file.mtime) < 0.000001
+            && (file.inode == 0 || now.inode == 0 || (file.inode == now.inode && file.device == now.device))
+    }
+
+    private func validate(_ files: [FileRecord]) throws {
+        guard files.allSatisfy(Self.isCurrent) else { throw SourceChanged() }
+    }
+
+    private func commitTransaction(_ files: [FileRecord], _ body: () throws -> Void) throws {
+        try store.db.transaction {
+            try validate(files)
+            try body()
+        }
+    }
+
+    private func refreshChanged(_ file: FileRecord) throws {
+        guard let now = FileSystem.info(of: file.path), now.isRegular, !now.dataless else {
+            try store.finish(file.id, state: "unavailable", detail: "source unavailable; waiting for the next sync")
+            return
+        }
+        let values = try? URL(fileURLWithPath: file.path).resourceValues(forKeys: Set(FileSystem.crawlKeys))
+        guard !FileSystem.isInCloud(values) else {
+            try store.finish(file.id, state: "unavailable", detail: "source is not downloaded")
+            return
+        }
+        try store.requeue(file.id, as: Candidate(path: file.path, kind: file.kind, size: now.size, mtime: now.mtime,
+                                                inode: now.inode, device: now.device))
+    }
+
     enum Payload: Sendable {
         case nothing
         case images(screenshot: Bool, ready: [ReadyImage])
@@ -345,8 +419,8 @@ public final class Indexer {
         case pdf(pages: [PDFExtractor.Page], read: Range<Int>, total: Int, title: String?)
         /// `chunks`: the ones in `read` (from 0) of the document's `total` (counted up to `IndexOptions.maxChunks` + 1).
         case doc(chunks: [String], read: Range<Int>, total: Int, characters: Int)
-        case audio(pieces: [MediaPiece], duration: Double)
-        case video(frames: [MediaPiece], sound: [MediaPiece], duration: Double)
+        case audio(pieces: [MediaPiece], duration: Double, read: Range<Int>)
+        case video(frames: [MediaPiece], sound: [MediaPiece], duration: Double, read: Range<Int>)
         case code(CodeExtractor.File)
     }
 
@@ -375,6 +449,48 @@ public final class Indexer {
 
     private let preparing = DispatchQueue(label: "DigUp.prepare", qos: .utility)
     private var jobsPrepared = 0   // names the scratch folders
+    private let preparationCache = PreparationCache()
+
+    /// Only the latest document stays in memory, and only on the serial preparation queue.
+    final class PreparationCache: @unchecked Sendable {
+        var discovery = CodeExtractor.DiscoveryCache()
+        var document: (key: String, chunks: [String], characters: Int)?
+        var documentReads = 0
+        var documentFolder: URL?
+        private var saved: [(key: String, url: URL, bytes: Int)] = []
+        private var savedBytes = 0
+
+        private struct Document: Codable { let chunks: [String]; let characters: Int }
+
+        func chunks(of url: URL, key: String, limit: Int) throws -> (chunks: [String], characters: Int) {
+            if document?.key != key {
+                if let cached = saved.first(where: { $0.key == key }),
+                   let data = try? Data(contentsOf: cached.url), let decoded = try? JSONDecoder().decode(Document.self, from: data) {
+                    document = (key, decoded.chunks, decoded.characters)
+                } else {
+                    let text = try DocExtractor.text(of: url)
+                    let extracted = Document(chunks: DocExtractor.chunks(text, limit: limit), characters: text.count)
+                    document = (key, extracted.chunks, extracted.characters)
+                    documentReads += 1
+                    // Keep only one decoded document, plus a bounded scratch cache for the first/later passes.
+                    if let documentFolder, let data = try? JSONEncoder().encode(extracted), data.count <= 64 << 20 {
+                        try? FileManager.default.createDirectory(at: documentFolder, withIntermediateDirectories: true)
+                        let destination = documentFolder.appendingPathComponent(UUID().uuidString + ".json")
+                        if (try? data.write(to: destination)) != nil {
+                            saved.append((key, destination, data.count)); savedBytes += data.count
+                            while savedBytes > 64 << 20, let oldest = saved.first {
+                                try? FileManager.default.removeItem(at: oldest.url)
+                                savedBytes -= oldest.bytes; saved.removeFirst()
+                            }
+                        }
+                    }
+                }
+            }
+            return (document!.chunks, document!.characters)
+        }
+    }
+
+    var documentExtractions: Int { preparing.sync { preparationCache.documentReads } }
 
     /// The file being read (extracted) right now, and since when: for a watchdog. Apple's frameworks have run away on
     /// some files (PDF text extraction growing by gigabytes a minute, never returning), and nothing stops them from
@@ -391,14 +507,15 @@ public final class Indexer {
     private func prepare(_ job: Job) -> PendingBatch {
         let pending = PendingBatch()
         jobsPrepared += 1
-        let (options, folder) = (options, scratch.appendingPathComponent("batch-\(jobsPrepared)"))
+        let (options, folder, cache) = (options, scratch.appendingPathComponent("batch-\(jobsPrepared)"), preparationCache)
         preparing.async {
-            pending.fulfill(Self.prepare(job, options: options, into: folder))
+            pending.fulfill(Self.prepare(job, options: options, into: folder, cache: cache))
         }
         return pending
     }
 
-    static func prepare(_ job: Job, options: IndexOptions, into folder: URL) -> Prepared {
+    static func prepare(_ job: Job, options: IndexOptions, into folder: URL,
+                        cache: PreparationCache = PreparationCache()) -> Prepared {
         let batch = job.files
         var prepared = Prepared(batch: batch, step: job.step, folder: folder)
         let url = URL(fileURLWithPath: batch[0].path)
@@ -406,11 +523,19 @@ public final class Indexer {
         defer { readingLock.withLock { reading = nil } }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            if batch[0].kind != .image, batch[0].kind != .screenshot, !isCurrent(batch[0]) {
+                prepared.outcomes[0] = Outcome(state: "changed", detail: "source changed or became unavailable")
+                return prepared
+            }
             switch batch[0].kind {
             case .image, .screenshot:
                 let screenshot = batch[0].kind == .screenshot
                 var ready: [ReadyImage] = []
                 for (slot, file) in batch.enumerated() {
+                    guard isCurrent(file) else {
+                        prepared.outcomes[slot] = Outcome(state: "changed", detail: "source changed or became unavailable")
+                        continue
+                    }
                     let url = URL(fileURLWithPath: file.path)
                     startReading(file.path)
                     do {
@@ -438,30 +563,35 @@ public final class Indexer {
                 }, minText: options.minPageText, renderPixels: 1400, to: folder)
                 prepared.payload = .pdf(pages: read.pages, read: wanted, total: read.total, title: read.title)
             case .doc:
-                // The chunks are cut the same way every time, so a later step goes on where the last one stopped.
-                let text = try DocExtractor.text(of: url)
-                let chunks = DocExtractor.chunks(text, limit: options.maxChunks + 1)
+                let file = batch[0]
+                let key = "\(file.path)|\(file.device):\(file.inode)|\(file.size)|\(file.mtime)|\(options.maxChunks)"
+                let document = try cache.chunks(of: url, key: key, limit: options.maxChunks + 1)
+                let chunks = document.chunks
                 let read = (job.step ?? 0..<options.docStep).clamped(to: 0..<min(chunks.count, options.maxChunks))
                 prepared.payload = .doc(chunks: Array(chunks[read]), read: read, total: chunks.count,
-                                        characters: text.count)
+                                        characters: document.characters)
             case .audio:
                 let (window, hop) = (options.audioWindow, options.audioHop)
+                let read = job.step ?? 0..<max(1, options.mediaWindowsPerStep)
+                let range = Double(read.lowerBound) * hop..<Double(read.upperBound) * hop
                 let (pieces, duration) = try runBlocking {
-                    try await AudioExtractor.windows(of: url, window: window, hop: hop, to: folder)
+                    try await AudioExtractor.windows(of: url, window: window, hop: hop, range: range, to: folder)
                 }
-                prepared.payload = .audio(pieces: pieces, duration: duration)
+                prepared.payload = .audio(pieces: pieces, duration: duration, read: read)
             case .video:
                 let (interval, window, hop) = (options.frameInterval, options.audioWindow, options.audioHop)
+                let read = job.step ?? 0..<max(1, options.mediaWindowsPerStep)
+                let range = Double(read.lowerBound) * hop..<Double(read.upperBound) * hop
                 let (frames, duration, hasAudio) = try runBlocking {
-                    try await VideoExtractor.keyframes(of: url, every: interval, maxPixel: 1024, to: folder)
+                    try await VideoExtractor.keyframes(of: url, every: interval, maxPixel: 1024, range: range, to: folder)
                 }
                 let sound = hasAudio
-                    ? try runBlocking { try await AudioExtractor.windows(of: url, window: window, hop: hop, to: folder) }
+                    ? try runBlocking { try await AudioExtractor.windows(of: url, window: window, hop: hop, range: range, to: folder) }
                         .pieces
                     : []
-                prepared.payload = .video(frames: frames, sound: sound, duration: duration)
+                prepared.payload = .video(frames: frames, sound: sound, duration: duration, read: read)
             case .code:
-                prepared.payload = .code(try CodeExtractor.read(url, options: options))
+                prepared.payload = .code(try CodeExtractor.read(url, options: options, discovery: cache.discovery))
             }
         } catch let error as ExtractError {
             if case .leftOut = error {
@@ -485,6 +615,7 @@ public final class Indexer {
 
     private func commit(_ prepared: Prepared) throws -> [(String, String?)] {
         let batch = prepared.batch
+        try validate(batch)
         let later = prepared.step != nil
         if let step = prepared.step, let outcome = prepared.outcomes[0] {
             return [try stopReading(batch[0], at: step.lowerBound, because: outcome.detail ?? outcome.state)]
@@ -505,16 +636,18 @@ public final class Indexer {
             case .doc(let chunks, let read, let total, let characters):
                 results[0] = try doc(batch[0], chunks: chunks, read: read, total: total, characters: characters,
                                      later: later)
-            case .audio(let pieces, let duration):
-                results[0] = try audio(batch[0], pieces: pieces, duration: duration)
-            case .video(let frames, let sound, let duration):
-                results[0] = try video(batch[0], frames: frames, sound: sound, duration: duration)
+            case .audio(let pieces, let duration, let read):
+                results[0] = try audio(batch[0], pieces: pieces, duration: duration, read: read)
+            case .video(let frames, let sound, let duration, let read):
+                results[0] = try video(batch[0], frames: frames, sound: sound, duration: duration, read: read)
             case .code(let code):
                 results[0] = try self.code(batch[0], code)
             }
         } catch let error as WorkerError {
             throw error
         } catch let error as IndexerError {
+            throw error
+        } catch let error as SourceChanged {
             throw error
         } catch {
             if let step = prepared.step { return [try stopReading(batch[0], at: step.lowerBound, because: "\(error)")] }
@@ -526,15 +659,14 @@ public final class Indexer {
         return results
     }
 
-    /// A long file that can't be read any further: it keeps the pages or chunks read so far, which stay searchable,
-    /// and counts as done rather than failed or waiting to be tried again and again.
+    /// A long file that can't be read any further keeps its searchable segments and reports a visible failure.
     private func stopReading(_ file: FileRecord, at place: Int, because problem: String) throws -> (String, String?) {
         var info = try store.info(of: file.id)
         info["read_to"] = nil
         info["read_end"] = nil
         let unit = file.kind == .pdf ? "page" : "chunk"
-        try store.finish(file.id, state: "done", detail: "read to \(unit) \(place), not after: \(problem)", info: info)
-        return ("done", "stopped before \(unit) \(place + 1): \(problem)")
+        try store.finish(file.id, state: "failed", detail: "read to \(unit) \(place), not after: \(problem)", info: info)
+        return ("failed", "stopped before \(unit) \(place + 1): \(problem)")
     }
 
     private func images(_ batch: [FileRecord], screenshot: Bool, ready: [ReadyImage],
@@ -543,7 +675,8 @@ public final class Indexer {
         let worker = try fullWorker()
         let vectors = try worker.embedImages(ready.map(\.image.path),
                                              budget: screenshot ? options.screenshotBudget : options.photoBudget)
-        try store.db.transaction {
+        guard vectors.count == ready.count else { throw WorkerError.failed("image result count mismatch") }
+        try commitTransaction(batch) {
             for (position, item) in ready.enumerated() {
                 let file = batch[item.slot]
                 guard let vector = vectors[position].vector else {
@@ -582,22 +715,30 @@ public final class Indexer {
         // A page that's mostly digits (a table, a data listing) gets keyword search only.
         let wordPages = textPages.filter { SearchText.hasWords($0.text) }
         let imagePages = pages.filter { $0.imagePath != nil }
+        let savedImages = try vectorPlaces(file: file.id, kind: .pageImage,
+                                          from: Double(read.lowerBound + 1), to: Double(read.upperBound + 1))
+        let missingImages = imagePages.filter { !savedImages.contains(Double($0.number)) }
         let garbledPages = pages.filter { $0.garbled != nil }   // rendered too: among `imagePages`
         var textVectors: [Int: [Float]] = [:]   // by page number
         var imageVectors: [Embedding] = []
         var garbledVectors: [[Float]] = []
-        if !wordPages.isEmpty || !imagePages.isEmpty {
+        if !wordPages.isEmpty || !missingImages.isEmpty || !garbledPages.isEmpty {
             let worker = try fullWorker()
             let vectors = try worker.embedTexts(wordPages.map {
                 Prompts.document(title: title, text: String($0.text.prefix(4000)))
             })
             textVectors = Dictionary(uniqueKeysWithValues: zip(wordPages.map(\.number), vectors))
-            imageVectors = try worker.embedImages(imagePages.compactMap(\.imagePath), budget: options.pageBudget)
+            imageVectors = try worker.embedImages(missingImages.compactMap(\.imagePath), budget: options.pageBudget)
+            guard vectors.count == wordPages.count, imageVectors.count == missingImages.count else {
+                throw WorkerError.failed("PDF result count mismatch")
+            }
             garbledVectors = try worker.embedTexts(garbledPages.map {
                 Prompts.document(title: title, text: String($0.garbled!.prefix(4000)))
             })
         }
-        try store.db.transaction {
+        var result = (unread ? "partial" : "done", Optional<String>.none)
+        try commitTransaction([file]) {
+            try store.deleteSegments(of: file.id, kind: .page, from: Double(read.lowerBound + 1), through: Double(read.upperBound))
             // Meaning only: the garbled words are never shown or matched against what you type.
             for (page, vector) in zip(garbledPages, garbledVectors) {
                 try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(page.number), vector: vector)
@@ -606,23 +747,27 @@ public final class Indexer {
                 try store.addSegment(file: file.id, kind: .page, modality: .text, loc: Double(page.number),
                                      excerpt: excerpt(page.text), text: page.text, vector: textVectors[page.number])
             }
-            for (page, embedding) in zip(imagePages, imageVectors) {
+            for (page, embedding) in zip(missingImages, imageVectors) {
+                try store.deleteSegments(of: file.id, kind: .pageImage, from: Double(page.number), through: Double(page.number))
                 try store.addSegment(file: file.id, kind: .pageImage, modality: .image, loc: Double(page.number),
                                      excerpt: page.text.isEmpty ? nil : excerpt(page.text), text: page.text,
                                      vector: embedding.vector)
             }
             var info = later ? try store.info(of: file.id) : [:]
             info["pages"] = "\(total)"
-            info["scanned_pages"] = "\((info["scanned_pages"].flatMap(Int.init) ?? 0) + imagePages.count)"
-            info["read_to"] = unread ? "\(read.upperBound)" : nil
-            info["read_end"] = unread ? "\(end)" : nil
-            let detail = unread ? "read to page \(read.upperBound) of \(total)"
-                : end < total ? "the first \(end) of \(total) pages" : nil
-            try store.finish(file.id, state: unread ? "partial" : "done", detail: detail, info: info)
+            var scanned = 0
+            try store.db.query("SELECT COUNT(*) FROM segments WHERE file = ? AND kind = 'page_image'", [.int(file.id)]) {
+                scanned = Int($0.int(0))
+            }
+            info["scanned_pages"] = String(scanned)
+            result = try finishStep(file, read: read, end: end, info: info,
+                                    failures: imageVectors.compactMap { $0.vector == nil ? ($0.error ?? "missing page vector") : nil },
+                                    detail: unread ? "read to page \(read.upperBound) of \(total)"
+                                        : end < total ? "the first \(end) of \(total) pages" : nil)
         }
         let ocr = pages.filter(\.ocr).count
         let span = later ? "pages \(read.lowerBound + 1)–\(read.upperBound) of \(total)" : "\(pages.count)/\(total) pages"
-        return (unread ? "partial" : "done", "\(span), \(imagePages.count) as images" + (ocr > 0 ? ", \(ocr) read by OCR" : ""))
+        return (result.0, result.1 ?? "\(span), \(imagePages.count) as images" + (ocr > 0 ? ", \(ocr) read by OCR" : ""))
     }
 
     /// Chunks `read` of a document (all of a short one, a step of a long one), the way `pdf` reads pages.
@@ -641,7 +786,7 @@ public final class Indexer {
         let vector = Dictionary(uniqueKeysWithValues: zip(worded, vectors))
         let end = min(total, options.maxChunks)
         let unread = read.upperBound < end
-        try store.db.transaction {
+        try commitTransaction([file]) {
             for (offset, chunk) in chunks.enumerated() {
                 try store.addSegment(file: file.id, kind: .chunk, modality: .text,
                                      loc: Double(read.lowerBound + offset + 1), excerpt: excerpt(chunk), text: chunk,
@@ -672,7 +817,7 @@ public final class Indexer {
             Prompts.document(title: code.title, text: code.pieces[$0].text)
         })
         let vector = Dictionary(uniqueKeysWithValues: zip(worded, vectors))
-        try store.db.transaction {
+        try commitTransaction([file]) {
             for (offset, piece) in code.pieces.enumerated() {
                 try store.addSegment(file: file.id, kind: code.cells == nil ? .lines : .cells, modality: .text,
                                      loc: Double(piece.first), locEnd: Double(piece.last),
@@ -687,43 +832,94 @@ public final class Indexer {
                 + (worded.count < code.pieces.count ? ", \(code.pieces.count - worded.count) for keywords only" : ""))
     }
 
-    private func audio(_ file: FileRecord, pieces: [MediaPiece], duration: Double) throws -> (String, String?) {
-        guard !pieces.isEmpty else {
-            try store.finish(file.id, state: "skipped", detail: "silent or shorter than 2 s")
-            return ("skipped", "silent or too short")
+    /// A failed batch keeps successful segments and its starting checkpoint. Retries are bounded, so a bad
+    /// input cannot keep the helper busy forever. A later explicit reindex can retry a terminal failure.
+    private func finishStep(_ file: FileRecord, read: Range<Int>, end: Int, info initial: [String: String],
+                            failures: [String], detail: String? = nil) throws -> (String, String?) {
+        var info = initial
+        if !failures.isEmpty {
+            let previous = try store.info(of: file.id)
+            let retries = (previous["embedding_retries"].flatMap(Int.init) ?? 0) + 1
+            info["embedding_retries"] = String(retries)
+            info["read_to"] = String(read.lowerBound)
+            info["read_end"] = String(end)
+            let detail = "embedding failed (attempt \(retries)/3): " + failures.prefix(3).joined(separator: "; ")
+            try store.finish(file.id, state: retries < 3 ? "partial" : "failed", detail: detail, info: info)
+            return ("failed", detail)
         }
-        let vectors = try fullWorker().embedAudio(pieces.map(\.path))
-        try store.db.transaction {
-            for (piece, embedding) in zip(pieces, vectors) {
+        let unread = read.upperBound < end
+        info["embedding_retries"] = nil
+        info["read_to"] = unread ? String(read.upperBound) : nil
+        info["read_end"] = unread ? String(end) : nil
+        try store.finish(file.id, state: unread ? "partial" : "done", detail: detail, info: info)
+        return (unread ? "partial" : "done", nil)
+    }
+
+    private func vectorPlaces(file: Int64, kind: SegmentKind, from: Double, to: Double) throws -> Set<Double> {
+        var places = Set<Double>()
+        try store.db.query("SELECT loc FROM segments WHERE file = ? AND kind = ? AND vec IS NOT NULL AND loc >= ? AND loc < ?",
+                           [.int(file), .text(kind.rawValue), .double(from - 0.00001), .double(to)]) {
+            places.insert($0.double(0))
+        }
+        return places
+    }
+
+    private func audio(_ file: FileRecord, pieces: [MediaPiece], duration: Double, read: Range<Int>) throws
+        -> (String, String?) {
+        let saved = try vectorPlaces(file: file.id, kind: .audio, from: Double(read.lowerBound) * options.audioHop,
+                                     to: Double(read.upperBound) * options.audioHop)
+        let missing = pieces.filter { !saved.contains($0.start) }
+        let vectors = missing.isEmpty ? [] : try fullWorker().embedAudio(missing.map(\.path))
+        guard vectors.count == missing.count else { throw WorkerError.failed("audio result count mismatch") }
+        let end = Int(ceil(duration / options.audioHop))
+        var result = ("done", Optional<String>.none)
+        try commitTransaction([file]) {
+            for (piece, embedding) in zip(missing, vectors) where embedding.vector != nil {
+                try store.deleteSegments(of: file.id, kind: .audio, from: piece.start, through: piece.start)
                 try store.addSegment(file: file.id, kind: .audio, modality: .audio, loc: piece.start, locEnd: piece.end,
                                      vector: embedding.vector)
             }
-            try store.finish(file.id, state: "done", info: ["duration": String(format: "%.1f", duration)])
+            result = try finishStep(file, read: read, end: end, info: ["duration": String(format: "%.1f", duration)],
+                                    failures: vectors.compactMap { $0.vector == nil ? ($0.error ?? "missing audio vector") : nil })
         }
-        return ("done", "\(pieces.count) windows, \(Int(duration)) s")
+        return (result.0, result.1 ?? "\(pieces.count) windows, \(Int(duration)) s")
     }
 
-    private func video(_ file: FileRecord, frames: [MediaPiece], sound: [MediaPiece], duration: Double) throws
-        -> (String, String?) {
-        guard !frames.isEmpty || !sound.isEmpty else {
-            try store.finish(file.id, state: "skipped", detail: "no frames or sound")
-            return ("skipped", "no frames or sound")
+    private func video(_ file: FileRecord, frames: [MediaPiece], sound: [MediaPiece], duration: Double,
+                       read: Range<Int>) throws -> (String, String?) {
+        let start = Double(read.lowerBound) * options.audioHop, end = Double(read.upperBound) * options.audioHop
+        let savedFrames = try vectorPlaces(file: file.id, kind: .frame, from: start, to: end)
+        let savedAudio = try vectorPlaces(file: file.id, kind: .audio, from: start, to: end)
+        let missingFrames = frames.filter { !savedFrames.contains($0.start) }
+        let missingSound = sound.filter { !savedAudio.contains($0.start) }
+        let worker = missingFrames.isEmpty && missingSound.isEmpty ? nil : try fullWorker()
+        let frameVectors = try worker?.embedImages(missingFrames.map(\.path), budget: options.frameBudget) ?? []
+        let soundVectors = try worker?.embedAudio(missingSound.map(\.path)) ?? []
+        guard frameVectors.count == missingFrames.count, soundVectors.count == missingSound.count else {
+            throw WorkerError.failed("video result count mismatch")
         }
-        let worker = try fullWorker()
-        let frameVectors = try worker.embedImages(frames.map(\.path), budget: options.frameBudget)
-        let soundVectors = try worker.embedAudio(sound.map(\.path))
-        try store.db.transaction {
-            for (frame, embedding) in zip(frames, frameVectors) {
+        var result = ("done", Optional<String>.none)
+        try commitTransaction([file]) {
+            for (frame, embedding) in zip(missingFrames, frameVectors) where embedding.vector != nil {
+                try store.deleteSegments(of: file.id, kind: .frame, from: frame.start, through: frame.start)
                 try store.addSegment(file: file.id, kind: .frame, modality: .image, loc: frame.start,
                                      locEnd: frame.end, vector: embedding.vector)
             }
-            for (piece, embedding) in zip(sound, soundVectors) {
+            for (piece, embedding) in zip(missingSound, soundVectors) where embedding.vector != nil {
+                try store.deleteSegments(of: file.id, kind: .audio, from: piece.start, through: piece.start)
                 try store.addSegment(file: file.id, kind: .audio, modality: .audio, loc: piece.start,
                                      locEnd: piece.end, vector: embedding.vector)
             }
-            try store.finish(file.id, state: "done", info: ["duration": String(format: "%.1f", duration),
-                                                            "frames": "\(frames.count)", "sound_windows": "\(sound.count)"])
+            var counts: [String: String] = [:]
+            try store.db.query("SELECT kind, COUNT(*) FROM segments WHERE file = ? GROUP BY kind", [.int(file.id)]) {
+                counts[$0.text(0) ?? ""] = String($0.int(1))
+            }
+            let failures = (frameVectors + soundVectors).compactMap { $0.vector == nil ? ($0.error ?? "missing media vector") : nil }
+            result = try finishStep(file, read: read, end: Int(ceil(duration / options.audioHop)),
+                                    info: ["duration": String(format: "%.1f", duration),
+                                           "frames": counts["frame"] ?? "0", "sound_windows": counts["audio"] ?? "0"],
+                                    failures: failures)
         }
-        return ("done", "\(frames.count) frames, \(sound.count) sound windows, \(Int(duration)) s")
+        return (result.0, result.1 ?? "\(frames.count) frames, \(sound.count) sound windows, \(Int(duration)) s")
     }
 }

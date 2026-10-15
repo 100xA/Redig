@@ -13,6 +13,7 @@ public final class Database {
     }
 
     let handle: OpaquePointer
+    private var savepoint = 0
 
     public init(path: String) throws {
         var db: OpaquePointer?
@@ -58,9 +59,41 @@ public final class Database {
 
     public func run(_ sql: String, _ values: [SQLValue] = []) throws { try query(sql, values) }
 
+    /// Stops stepping as soon as the caller has enough rows. Finalizing the statement also releases its read lock.
+    func queryUntil(_ sql: String, _ values: [SQLValue] = [], row: (Statement) throws -> Bool) throws {
+        let statement = try Statement(self, sql)
+        try statement.bind(values)
+        while try statement.step() { if try !row(statement) { break } }
+    }
+
     @discardableResult
     public func transaction<T>(_ body: () throws -> T) throws -> T {
-        try execute("BEGIN IMMEDIATE")
+        if sqlite3_get_autocommit(handle) == 0 {
+            savepoint += 1
+            let name = "digup_\(savepoint)"
+            try execute("SAVEPOINT \(name)")
+            do {
+                let result = try body()
+                try execute("RELEASE \(name)")
+                return result
+            } catch {
+                try? execute("ROLLBACK TO \(name)")
+                try? execute("RELEASE \(name)")
+                throw error
+            }
+        }
+        return try transaction(begin: "BEGIN IMMEDIATE", body)
+    }
+
+    /// One WAL snapshot without reserving the writer. Nested reads share their caller's snapshot.
+    @discardableResult
+    public func readTransaction<T>(_ body: () throws -> T) throws -> T {
+        if sqlite3_get_autocommit(handle) == 0 { return try body() }
+        return try transaction(begin: "BEGIN DEFERRED", body)
+    }
+
+    private func transaction<T>(begin: String, _ body: () throws -> T) throws -> T {
+        try execute(begin)
         do {
             let result = try body()
             try execute("COMMIT")
@@ -132,6 +165,12 @@ public final class Statement {
     public func blob(_ column: Int32) -> Data? {
         guard let bytes = sqlite3_column_blob(statement, column) else { return nil }
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, column)))
+    }
+
+    /// The bytes belong to SQLite and stay valid only until the statement advances. No intermediate Data allocation.
+    func withBlob<T>(_ column: Int32, _ body: (UnsafeRawBufferPointer) throws -> T) rethrows -> T? {
+        guard let bytes = sqlite3_column_blob(statement, column) else { return nil }
+        return try body(UnsafeRawBufferPointer(start: bytes, count: Int(sqlite3_column_bytes(statement, column))))
     }
 }
 

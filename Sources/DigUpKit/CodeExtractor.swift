@@ -26,9 +26,9 @@ public enum CodeExtractor {
     /// The model reads 2,048 tokens of an input at most; a single line longer than this is cut here.
     static let longestPiece = 4000
 
-    static func read(_ url: URL, options: IndexOptions) throws -> File {
+    static func read(_ url: URL, options: IndexOptions, discovery: DiscoveryCache? = nil) throws -> File {
         let data = try Data(contentsOf: url)
-        let (repo, title) = place(of: url.path)
+        let (repo, title) = place(of: url.path, discovery: discovery)
         if url.pathExtension.lowercased() == "ipynb" {
             let cells = try notebookCells(data)
             let text = cells.joined(separator: "\n")
@@ -198,16 +198,45 @@ public enum CodeExtractor {
 
     /// The repo (or code project) `path` is in, and the file's title: its path from the repo's folder, the repo's name
     /// first. Outside any: its folder's name and its own.
-    static func place(of path: String) -> (repo: String?, title: String) {
+    /// Used on the serial preparation queue. Cache folder discovery, never a file's title; a new crawl clears it.
+    final class DiscoveryCache: @unchecked Sendable {
+        private var projects: [String: String?] = [:]
+
+        func project(in start: String) -> String? {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            var folder = start
+            var trail: [String] = []
+            var project: String?
+            while folder.count > 1, folder != home {
+                if let known = projects[folder] { project = known; break }
+                trail.append(folder)
+                if FileManager.default.fileExists(atPath: folder + "/.git") || Rules.isProjectRoot(folder) {
+                    project = folder
+                    break
+                }
+                folder = (folder as NSString).deletingLastPathComponent
+            }
+            for visited in trail { projects[visited] = .some(project) }
+            return project
+        }
+    }
+
+    static func place(of path: String, discovery: DiscoveryCache? = nil) -> (repo: String?, title: String) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var folder = (path as NSString).deletingLastPathComponent
-        var repo: String?
-        while folder.count > 1, folder != home {
-            if FileManager.default.fileExists(atPath: folder + "/.git") || Rules.isProjectRoot(folder) {
-                repo = folder
-                break
+        let repo: String?
+        if let discovery {
+            repo = discovery.project(in: folder)
+        } else {
+            var found: String?
+            while folder.count > 1, folder != home {
+                if FileManager.default.fileExists(atPath: folder + "/.git") || Rules.isProjectRoot(folder) {
+                    found = folder
+                    break
+                }
+                folder = (folder as NSString).deletingLastPathComponent
             }
-            folder = (folder as NSString).deletingLastPathComponent
+            repo = found
         }
         if let repo {
             let parent = (repo as NSString).deletingLastPathComponent

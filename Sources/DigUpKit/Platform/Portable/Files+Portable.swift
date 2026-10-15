@@ -160,6 +160,8 @@ final class DirectoryWalk {
     private let keys: [URLResourceKey]
     private var pending: [URL]   // what's next, last first
     private var opened: URL?     // the folder just returned: its contents come next, unless skipped
+    private var visited = Set<String>()
+    private(set) var failedFolders: [String] = []
 
     init(_ root: URL, keys: [URLResourceKey]) {
         self.keys = keys
@@ -180,8 +182,40 @@ final class DirectoryWalk {
     func skipDescendants() { opened = nil }
 
     private func contents(of folder: URL) -> [URL] {
-        let found = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys,
-                                                                  options: [.skipsHiddenFiles])) ?? []
+        // Foundation reports a directory junction as a directory. Inspect its reparse tag before descending.
+        let native = folder.path.replacingOccurrences(of: "/", with: "\\")
+        var attributes = WIN32_FIND_DATAW()
+        let search = native.withCString(encodedAs: UTF16.self) {
+            FindFirstFileExW($0, FindExInfoBasic, &attributes, FindExSearchNameMatch, nil, 0)
+        }
+        if let search, search != INVALID_HANDLE_VALUE {
+            FindClose(search)
+            if attributes.dwFileAttributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+               attributes.dwReserved0 == 0xA000_0003 || attributes.dwReserved0 == 0xA000_000C {
+                failedFolders.append(folder.path)
+                return []
+            }
+        }
+        let handle = native.withCString(encodedAs: UTF16.self) {
+            CreateFileW($0, 0, DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE), nil,
+                        DWORD(OPEN_EXISTING), DWORD(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT), nil)
+        }
+        if let handle, handle != INVALID_HANDLE_VALUE {
+            defer { CloseHandle(handle) }
+            var info = BY_HANDLE_FILE_INFORMATION()
+            if GetFileInformationByHandle(handle, &info) {
+                let identity = "\(info.dwVolumeSerialNumber):\(info.nFileIndexHigh):\(info.nFileIndexLow)"
+                guard visited.insert(identity).inserted else { return [] }
+            }
+        }
+        let found: [URL]
+        do {
+            found = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys,
+                                                               options: [.skipsHiddenFiles])
+        } catch {
+            failedFolders.append(folder.path)
+            return []
+        }
         return found.filter { !$0.lastPathComponent.hasPrefix(".") }
     }
 }

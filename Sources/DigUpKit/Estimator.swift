@@ -98,11 +98,21 @@ public enum Estimator {
             case .audio:
                 let seconds = duration(of: file.path)
                 estimate.audioSeconds += seconds
-                estimate.seconds += seconds * costs.audioSecond
+                let first = min(seconds, Double(max(1, options.mediaWindowsPerStep)) * options.audioHop)
+                estimate.seconds += first * costs.audioSecond
+                if seconds > first {
+                    estimate.longFiles += 1
+                    estimate.laterSeconds += (seconds - first) * costs.audioSecond
+                }
             case .video:
                 let seconds = duration(of: file.path)
                 estimate.videoSeconds += seconds
-                estimate.seconds += seconds * costs.videoSecond
+                let first = min(seconds, Double(max(1, options.mediaWindowsPerStep)) * options.audioHop)
+                estimate.seconds += first * costs.videoSecond
+                if seconds > first {
+                    estimate.longFiles += 1
+                    estimate.laterSeconds += (seconds - first) * costs.videoSecond
+                }
             case .code:
                 // A notebook's file is mostly its outputs, which aren't read: a guess at its cells' share.
                 let characters = file.path.lowercased().hasSuffix(".ipynb") ? file.size / 8 : file.size

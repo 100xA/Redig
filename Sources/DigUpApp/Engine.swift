@@ -8,8 +8,8 @@ nonisolated struct EngineStatus: Sendable, Equatable {
         case idle
         case syncing
         case indexing(done: Int, total: Int)
-        /// The rest of long PDFs and documents (`Indexer.finishLongFiles`): `done` of the `total` pages and chunks this
-        /// pass set out to read, `files` long files still unfinished.
+        /// The rest of long files (`Indexer.finishLongFiles`): `done` of the `total` pages, chunks or media windows
+        /// this pass set out to read, `files` long files still unfinished.
         case finishing(done: Int, total: Int, files: Int)
         case failed(String)
     }
@@ -27,7 +27,7 @@ nonisolated struct EngineStatus: Sendable, Equatable {
     var files = 0        // in the index, any state
     var searchable = 0   // done or partial
     var pending = 0      // waiting to be embedded
-    var unfinished = 0   // long files with pages or chunks still to read (the backfill's rules hold them up too)
+    var unfinished = 0   // long files with pages, chunks or media windows still to read
     var vectors = 0
     var paused = false
     var waitingFor: String?   // why the backfill waits ("on battery"), if it does
@@ -136,6 +136,12 @@ nonisolated final class Engine: @unchecked Sendable {
     private var excludedTypes: [String]
     private var codeRoots: [URL]
     private var codeExcluded: [URL]
+    private var searchScope: (roots: [String], skipped: [String])
+    private var codeSearchScope: (roots: [String], skipped: [String])
+
+    private static func pathSpellings(_ folders: [URL]) -> [String] {
+        Array(Set(folders.flatMap { [$0.path, FolderSelection.realPath($0.path)] }))
+    }
 
     // indexQueue only
     /// Code search was turned off: the code index goes once no helper has it open.
@@ -146,7 +152,6 @@ nonisolated final class Engine: @unchecked Sendable {
     private var searchStore: IndexStore?
     private var codeSearcher: Searcher?
     private var codeStore: IndexStore?
-    private var warnedAboutSource = false
 
     // encoderQueue only
     private var encoder: EmbeddingWorker?
@@ -174,6 +179,8 @@ nonisolated final class Engine: @unchecked Sendable {
         excludedTypes = settings.excludedTypes
         codeRoots = settings.codeRoots
         codeExcluded = settings.codeExcluded
+        searchScope = (Self.pathSpellings(settings.roots), Self.pathSpellings(settings.excludedFolders))
+        codeSearchScope = (Self.pathSpellings(settings.codeRoots), Self.pathSpellings(settings.codeExcluded))
         codeQuietSeconds = settings.codeQuietSeconds
         pruneWanted = !settings.roots.isEmpty
         self.backfillBlocker = backfillBlocker
@@ -229,10 +236,12 @@ nonisolated final class Engine: @unchecked Sendable {
     /// New code folders (none: code search off). The helper restarts with them; without any, the code index is deleted
     /// once the helper is gone.
     func setCodeFolders(roots: [URL], excluded: [URL]) {
+        let scope = (Self.pathSpellings(roots), Self.pathSpellings(excluded))
         let wasOn = lock.withLock { () -> Bool in
             defer {
                 codeRoots = roots
                 codeExcluded = excluded
+                codeSearchScope = scope
             }
             return !codeRoots.isEmpty
         }
@@ -266,10 +275,12 @@ nonisolated final class Engine: @unchecked Sendable {
     /// New folders or exclusions: the watcher follows, and the helper restarts with them once its current batch is
     /// done. Files under folders that are no longer chosen, or newly excluded, leave the index.
     func setFolders(roots: [URL], excluded: [URL], excludedTypes: [String]) {
+        let scope = (Self.pathSpellings(roots), Self.pathSpellings(excluded))
         lock.withLock {
             self.roots = roots
             self.excluded = excluded
             self.excludedTypes = excludedTypes
+            searchScope = scope
         }
         log("folders: \(roots.map { tildePath($0.path) })" + (excluded.isEmpty ? "" : " minus \(excluded.map { tildePath($0.path) })")
             + (excludedTypes.isEmpty ? "" : " · skipping .\(excludedTypes.joined(separator: ", ."))"))
@@ -299,6 +310,10 @@ nonisolated final class Engine: @unchecked Sendable {
 
     /// A drive was connected or ejected: a missing folder may be back (or gone).
     func volumesChanged() {
+        let folders = lock.withLock { (roots, excluded, codeRoots, codeExcluded) }
+        let mainScope = (Self.pathSpellings(folders.0), Self.pathSpellings(folders.1))
+        let codeScope = (Self.pathSpellings(folders.2), Self.pathSpellings(folders.3))
+        lock.withLock { searchScope = mainScope; codeSearchScope = codeScope }
         watchQueue.async { [self] in
             startWatching()
             startWatchingCode()
@@ -393,11 +408,8 @@ nonisolated final class Engine: @unchecked Sendable {
         watcher = nil
         let (roots, excluded) = lock.withLock { (self.roots, self.excluded) }
         let present = roots.filter(AppSettings.isFolder)
-        func spellings(_ folders: [URL]) -> [String] {
-            Array(Set(folders.flatMap { [$0.path, FolderSelection.realPath($0.path)] }))
-        }
-        watchedRoots = spellings(present)
-        watchedSkips = spellings(excluded)
+        watchedRoots = Self.pathSpellings(present)
+        watchedSkips = Self.pathSpellings(excluded)
         guard !present.isEmpty else { return }
         watcher = FolderWatcher(paths: present.map(\.path), latency: 0.25, queue: watchQueue) { [weak self] paths in
             self?.foldersChanged(paths)
@@ -423,7 +435,8 @@ nonisolated final class Engine: @unchecked Sendable {
     /// code search never reads (git's own files, builds, dependencies) don't count.
     private func codeChanged(_ paths: [String]) {
         let relevant = paths.filter { path in
-            !path.split(separator: "/").contains { part in
+            if FolderWatcher.isPolicyChange(path) { return true }
+            return !path.split(separator: "/").contains { part in
                 part.hasPrefix(".") || Self.codeNoise.contains(String(part))
             }
         }
@@ -457,7 +470,8 @@ nonisolated final class Engine: @unchecked Sendable {
     private func foldersChanged(_ paths: [String]) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let paths = paths.filter { path in
-            watchedRoots.contains { Rules.isWalked(path, root: $0, home: home, excluded: watchedSkips) }
+            let scope = FolderWatcher.policyScope(of: path) ?? path
+            return watchedRoots.contains { Rules.isWalked(scope, root: $0, home: home, excluded: watchedSkips) }
         }
         guard !paths.isEmpty else { return }
         log("watch: \(paths.count) changed (\((paths.first as NSString?)?.lastPathComponent ?? ""))")
@@ -733,16 +747,16 @@ nonisolated final class Engine: @unchecked Sendable {
         }
     }
 
-    /// New vectors reach the panel: reload the searcher's copy, at most every 2 s during a long pass. If the panel
-    /// hasn't been used lately the vectors aren't loaded at all, and they load fresh when it opens.
+    /// Publish committed index changes at most every 2 s. Metadata stays current even while vectors are released;
+    /// the searcher applies the journal's changed files instead of copying the whole matrix after each batch.
     private func refreshSearcher(force: Bool) {
         guard force || Date().timeIntervalSince(lastSearcherRefresh) > 2 else { return }
         lastSearcherRefresh = Date()
         searchQueue.async { [self] in
-            guard let searcher, searcher.vectorsLoaded else { return }
+            guard let searcher else { return }
             let started = Date()
-            try? searcher.reload()
-            log("engine: searcher reloaded, \(searcher.vectorCount) vectors in \(ms(since: started))")
+            try? searcher.refresh()
+            log("engine: searcher refreshed, \(searcher.vectorCount) vectors in \(ms(since: started))")
         }
     }
 
@@ -753,8 +767,8 @@ nonisolated final class Engine: @unchecked Sendable {
         guard force || Date().timeIntervalSince(lastCodeRefresh) > 2 else { return }
         lastCodeRefresh = Date()
         searchQueue.async { [self] in
-            guard let codeSearcher, codeSearcher.vectorsLoaded else { return }
-            try? codeSearcher.reload()
+            guard let codeSearcher else { return }
+            try? codeSearcher.refresh()
         }
     }
 
@@ -812,28 +826,16 @@ nonisolated final class Engine: @unchecked Sendable {
         if code { return await searchCode(text, vector: vector, prefixLast: prefixLast, limit: limit) }
         return await withCheckedContinuation { continuation in
             searchQueue.async { [self] in
-                var values = vector?.values
-                if let vector, let indexed = searcher?.vectorSource, indexed != vector.source {
-                    if !warnedAboutSource {
-                        log("meaning search is off: the index was built with \(indexed), the encoder is \(vector.source)")
-                        warnedAboutSource = true
-                    }
-                    values = nil
+                let (folders, skipped, types): ([String], [String], Set<String>) = lock.withLock {
+                    (searchScope.roots, searchScope.skipped, Set(self.excludedTypes))
                 }
-                let hits = try? searcher?.search(text, queryVector: values, kinds: kinds, limit: limit,
-                                                 prefixLast: prefixLast)
-                // Only files that are searched (`FolderSelection`'s rule, as the crawler walks them) and of types not
-                // skipped: a removed folder's rows (or a newly skipped type's) can outlive it until a helper syncs
-                // (indexing was paused, or the app quit first).
-                let (chosen, excluded, types): ([URL], [URL], Set<String>) = lock.withLock {
-                    (self.roots, self.excluded, Set(self.excludedTypes))
-                }
-                let folders = chosen.map(\.path), skipped = excluded.map(\.path)
-                continuation.resume(returning: (hits ?? []).filter { hit in
-                    FolderSelection.isSearched(hit.path, folders: folders, skipped: skipped)
-                        && !types.contains((hit.path as NSString).pathExtension.lowercased())
-                        && FileManager.default.fileExists(atPath: hit.path)
-                })
+                let query = vector.map { Searcher.QueryVector(values: $0.values, source: $0.source) }
+                let hits = try? searcher?.search(text, query: query, kinds: kinds, limit: limit,
+                                                prefixLast: prefixLast, eligible: { path, _ in
+                    FolderSelection.isSearched(path, folders: folders, skipped: skipped)
+                        && !types.contains((path as NSString).pathExtension.lowercased())
+                }, available: { FileManager.default.fileExists(atPath: $0) })
+                continuation.resume(returning: hits ?? [])
             }
         }
     }
@@ -841,15 +843,14 @@ nonisolated final class Engine: @unchecked Sendable {
     private func searchCode(_ text: String, vector: QueryVector?, prefixLast: Bool, limit: Int) async -> [SearchHit] {
         await withCheckedContinuation { continuation in
             searchQueue.async { [self] in
-                let (roots, skipped) = lock.withLock { (codeRoots.map(\.path), codeExcluded.map(\.path)) }
+                let (roots, skipped) = lock.withLock { codeSearchScope }
                 guard !roots.isEmpty, let codeSearcher else { return continuation.resume(returning: []) }
-                var values = vector?.values
-                if let vector, let indexed = codeSearcher.vectorSource, indexed != vector.source { values = nil }
-                let hits = (try? codeSearcher.search(text, queryVector: values, limit: limit, prefixLast: prefixLast)) ?? []
-                continuation.resume(returning: hits.filter { hit in
-                    FolderSelection.isSearched(hit.path, folders: roots, skipped: skipped)
-                        && FileManager.default.fileExists(atPath: hit.path)
-                })
+                let query = vector.map { Searcher.QueryVector(values: $0.values, source: $0.source) }
+                let hits = try? codeSearcher.search(text, query: query, limit: limit, prefixLast: prefixLast,
+                                                   eligible: { path, _ in
+                    FolderSelection.isSearched(path, folders: roots, skipped: skipped)
+                }, available: { FileManager.default.fileExists(atPath: $0) })
+                continuation.resume(returning: hits ?? [])
             }
         }
     }
