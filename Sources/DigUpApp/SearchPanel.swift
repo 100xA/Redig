@@ -11,6 +11,7 @@ enum SearchPhase: Equatable {
     case wordsOnly   // final, but there's no meaning search (the model is downloading, or the encoder failed)
     case codeHint    // "code:" and nothing yet: what to type
     case codeOff     // "code:" without code folders: how to turn code search on
+    case commands    // local command palette; never sent to the encoder or file search
 }
 
 /// The hotkey panel: type, see results grouped by kind with the selected one previewed big on the right, and open /
@@ -44,6 +45,8 @@ final class SearchPanelController {
     private(set) var isCode = false
     private(set) var note: String?
     var encoder: EngineStatus.Encoder { model.status.encoder }
+    let commands: CommandPaletteController
+    var isCommandMode: Bool { phase == .commands }
 
     @ObservationIgnored let model: AppModel
     @ObservationIgnored private let engine: Engine
@@ -75,6 +78,7 @@ final class SearchPanelController {
         self.app = app
         model = app.model
         engine = app.engine
+        commands = CommandPaletteController(app: app)
     }
 
     var isVisible: Bool { window?.isVisible == true && !fading }
@@ -98,7 +102,7 @@ final class SearchPanelController {
     func show() {
         let started = Date()
         shownAt = started
-        engine.prewarm()
+        if !CommandPaletteController.recognizes(query) { engine.prewarm() }
         let window = self.window ?? makeWindow()
         placeWindow(window)
         if AppController.offscreen { return }
@@ -165,6 +169,19 @@ final class SearchPanelController {
         navigated = false
         meaningTask?.cancel()
         let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        commands.update(query)
+        if CommandPaletteController.recognizes(typed) {
+            results = .empty
+            selection = nil
+            isCode = false
+            phase = .commands
+            if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+                QLPreviewPanel.shared().orderOut(nil)
+            }
+            PreviewPlayback.shared.stop()
+            resizeWindow()
+            return
+        }
         let codeText = CodeQuery.text(of: typed)
         isCode = codeText != nil
         let code = isCode
@@ -300,6 +317,11 @@ final class SearchPanelController {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         let previewing = QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        if isCommandMode {
+            // Let a focused Run/Undo button retain its standard Return/Space activation.
+            guard field?.currentEditor() != nil || event.keyCode == 53 else { return false }
+            return commands.handle(event) { [weak self] in self?.setCommandQuery($0) }
+        }
         switch event.keyCode {
         case 53:  // Esc
             if previewing { QLPreviewPanel.shared().orderOut(nil) } else { dismiss() }
@@ -399,6 +421,15 @@ final class SearchPanelController {
     /// An example from the code hint, as if typed.
     func tryExample(_ text: String) {
         query = text
+    }
+
+    /// Completing a command returns typing to the field, with its cursor after the completed text.
+    func setCommandQuery(_ text: String) {
+        query = text
+        guard let field else { return }
+        field.stringValue = text
+        field.window?.makeFirstResponder(field)
+        (field.currentEditor() as? NSTextView)?.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
     }
 
     /// Esc: hide, and give the keyboard back to the app you came from (at once: the fade doesn't hold it).

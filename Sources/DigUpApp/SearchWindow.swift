@@ -16,7 +16,7 @@ final class SearchWindowController: NSObject, NSWindowDelegate {
 
     init(app: AppController) {
         self.app = app
-        search = SearchModel(engine: app.engine)
+        search = SearchModel(app: app)
     }
 
     var isVisible: Bool { window?.isVisible == true }
@@ -109,6 +109,10 @@ final class SearchWindowController: NSObject, NSWindowDelegate {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             .subtracting([.capsLock, .numericPad, .function])
         let previewing = QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        if search.isCommandMode {
+            guard search.field?.currentEditor() != nil || event.keyCode == 53 else { return false }
+            return search.commands.handle(event) { [weak self] in self?.search.setCommandQuery($0) }
+        }
         switch event.keyCode {
         case 125, 126:   // ↓ ↑
             guard modifiers.isEmpty else { return false }
@@ -198,6 +202,7 @@ final class QuickLookWindow: NSWindow, QLPreviewPanelDataSource {
 /// The window's query: keyword and meaning results together after a short pause in typing, optionally of one kind.
 @Observable
 final class SearchModel {
+    let commands: CommandPaletteController
     var query = "" {
         didSet { if query != oldValue { run() } }
     }
@@ -222,8 +227,9 @@ final class SearchModel {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var task: Task<Void, Never>?
 
-    init(engine: Engine) {
-        self.engine = engine
+    init(app: AppController) {
+        self.engine = app.engine
+        commands = CommandPaletteController(app: app)
     }
 
     /// Every result shown, in order (strong ones, then the weaker ones once they're unfolded).
@@ -231,6 +237,7 @@ final class SearchModel {
 
     /// A search of code: the Code filter, or "code:" typed.
     var isCode: Bool { filter == .code || CodeQuery.text(of: query) != nil }
+    var isCommandMode: Bool { CommandPaletteController.recognizes(query) }
     var selectedRow: ResultRow? { rows.first { $0.id == selection } ?? rows.first }
 
     /// A click on a result: like the arrow keys, it makes Space and ← → act on the results.
@@ -248,6 +255,14 @@ final class SearchModel {
     func focusField() {
         guard let field, field.currentEditor() == nil else { return }
         field.window?.makeFirstResponder(field)
+    }
+
+    func setCommandQuery(_ text: String) {
+        query = text
+        guard let field else { return }
+        field.stringValue = text
+        field.window?.makeFirstResponder(field)
+        (field.currentEditor() as? NSTextView)?.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
     }
 
     /// The file in its app, at the page or moment that matched when the app can be told where.
@@ -269,9 +284,21 @@ final class SearchModel {
         task?.cancel()
         navigated = false
         let typed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        commands.update(query)
         let code = isCode
         let text = CodeQuery.text(of: typed) ?? typed
         codePhase = nil
+        if isCommandMode {
+            results = .empty
+            counts = [:]
+            selection = nil
+            hasResults = false
+            if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
+                QLPreviewPanel.shared().orderOut(nil)
+            }
+            PreviewPlayback.shared.stop()
+            return
+        }
         guard !typed.isEmpty else {
             results = .empty
             counts = [:]
@@ -367,7 +394,7 @@ struct SearchWindowView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 HStack(spacing: 9) {
-                    Image(systemName: search.isCode ? FileKind.code.symbol : "magnifyingglass")
+                    Image(systemName: search.isCommandMode ? "terminal" : search.isCode ? FileKind.code.symbol : "magnifyingglass")
                         .font(.system(size: search.isCode ? 15 : 17, weight: .semibold))
                         .foregroundStyle(Brand.gradient)
                         .frame(width: 22)
@@ -411,14 +438,27 @@ struct SearchWindowView: View {
             }
             .padding(.leading, 78)   // beside the window buttons
             .frame(height: 52)
-            KindFilters(search: search, showsCode: model.hasCode)
+            HStack {
+                if !search.isCommandMode { KindFilters(search: search, showsCode: model.hasCode) }
+                Spacer(minLength: 8)
+                Button {
+                    search.setCommandQuery(search.isCommandMode ? "" : ">")
+                } label: {
+                    Label(search.isCommandMode ? "Search files" : "Commands", systemImage: search.isCommandMode ? "magnifyingglass" : "terminal")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.borderless)
+                .help("Type > for organizer commands")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 10)
     }
 
     @ViewBuilder private var content: some View {
-        if !model.hasFolders {
+        if search.isCommandMode {
+            CommandPaletteView(controller: search.commands) { search.setCommandQuery($0) }
+        } else if !model.hasFolders {
             VStack(spacing: 0) {
                 BrandMark()
                 Text("Choose folders to search").font(.system(size: 20, weight: .bold)).padding(.top, 18)
@@ -462,7 +502,9 @@ struct SearchWindowView: View {
                 .lineLimit(1)
                 .help("Folders and indexing")
             Spacer()
-            if search.hasResults, !search.query.isEmpty {
+            if search.isCommandMode {
+                Text("↑↓ Choose   ⇥ Complete   ↩ Run   Esc Search").lineLimit(1)
+            } else if search.hasResults, !search.query.isEmpty {
                 Text(model.resultsCaveat ?? resultCount).lineLimit(1)
             }
             if let version = model.updateAvailable {
@@ -484,9 +526,9 @@ struct SearchWindowView: View {
 
     /// Examples of what to type: code's with the Code chip on, and one of them with code search on (as the panel's).
     private var placeholder: String {
+        if search.isCommandMode { return "Commands: >sort, >projects, >undo…" }
         if search.filter == .code { return "Describe the code: “retry a request with backoff”, a name in it…" }
-        return model.hasCode ? "Describe it: “zebra in a video”, “code: retry with backoff”…"
-            : "Describe it: “receipt from the hardware store”, “zebra in a video”…"
+        return "Search files, or type > for commands…"
     }
 
     private var resultCount: String {

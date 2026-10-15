@@ -243,8 +243,15 @@ enum DebugHooks {
                 }
             }
         }
-        panel.show()
-        panel.query = text
+        if CommandPaletteController.recognizes(text) {
+            // Commands settle locally: there is no embedding completion to wait for.
+            panel.query = text
+            panel.show()
+            DispatchQueue.main.async { panel.onFinalResults?() }
+        } else {
+            panel.show()
+            panel.query = text
+        }
     }
 
     /// `-debugPlay`: plays `row` from its moment, muted, and logs where playback is 1.5 s later.
@@ -352,7 +359,7 @@ enum DebugHooks {
                 let search = app.searchWindow.search
                 // The field with the cursor, as on screen (an offscreen window doesn't take it by itself).
                 if defaults.bool(forKey: "debugFocus") { DispatchQueue.main.async { search.focusField() } }
-                loaded = { search.query.isEmpty || search.hasResults }
+                loaded = { search.query.isEmpty || search.hasResults || search.isCommandMode }
                 draw = { try app.searchWindow.snapshot(to: $0) }
                 close = { app.searchWindow.close() }
             }

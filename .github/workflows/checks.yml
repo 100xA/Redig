@@ -19,6 +19,8 @@ jobs:
         run: bash scripts/test-kit.sh
       - name: Search service scheduling regressions
         run: bash scripts/test-search-service.sh
+      - name: Native organizer command regressions
+        run: bash scripts/test-organizer-commands.sh
 
   shell:
     strategy:

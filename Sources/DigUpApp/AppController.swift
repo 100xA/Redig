@@ -67,7 +67,7 @@ final class AppController {
         statusMenu.onOrganizer = { [weak self] in self?.showSettings(.organizer) }
         statusMenu.onSettings = { [weak self] in self?.showSettings() }
         statusMenu.onChooseFolders = { [weak self] in self?.chooseFolders() }
-        statusMenu.onPauseChanged = { [weak self] paused in self?.engine.setPaused(paused) }
+        statusMenu.onPauseChanged = { [weak self] paused in self?.setIndexingPaused(paused) }
         statusMenu.onCheckForUpdates = { [weak self] in self?.updates.checkNow() }
         updates.onSessionEnded = { [weak self] in self?.windowClosed() }
         updates.start()
@@ -117,6 +117,13 @@ final class AppController {
     }
 
     // MARK: Folders
+
+    func setIndexingPaused(_ paused: Bool) {
+        // Revoke queued filing immediately, before the engine's coalesced status update reaches the UI.
+        model.status.paused = paused
+        engine.setPaused(paused)
+        organizer.configurationChanged()
+    }
 
     /// The folders to index from now on, and those to skip in them (and the file types, when given); the engine
     /// follows without a relaunch. A folder another chosen one already searches is dropped (its files would be found

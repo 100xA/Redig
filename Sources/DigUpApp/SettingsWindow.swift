@@ -267,7 +267,7 @@ private struct FolderSettings: View {
     var body: some View {
         Form {
             Section {
-                IndexProgress(model: state.model) { state.app.engine.setPaused(!state.model.status.paused) }
+                IndexProgress(model: state.model) { state.app.setIndexingPaused(!state.model.status.paused) }
             }
             Section {
                 if let summaries = state.summaries {

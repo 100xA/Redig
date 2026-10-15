@@ -48,14 +48,20 @@ check for updates once a day; these checks are disabled in this source fork. No 
 
 ## Local organizer for Mac
 
-Open **Organize Files…** from the menu bar, or **Settings → Organizer**, and choose **Use Downloads, Desktop &
-Documents**. Redig groups indexed files into project collections using its existing local embeddings. A download can
-match a project in Documents or Desktop. You can rename collections and correct uncertain matches without moving files.
+Press **⇧⌘Space**, type **`>auto on`** and press Return to start watching Downloads. Or open **Settings → Organizer**
+and choose **Organize Downloads Automatically**. Drop related files into Downloads; once indexed and settled, clear
+groups of at least two related files can create their own folders under **Redig Organized**. Existing project folders
+can receive matching new files too. No project-folder setup is needed.
 
-Use **File** to move an individual match into its project folder, or enable **File strong matches automatically**.
-Automatic filing handles settled, loose files with a clear match to an established project. Uncertain files stay for
-review. Each move is recorded on disk; **Undo** restores an unchanged file when its original location is free, including
-after restarting the app. Returned files are excluded from automatic refiling.
+Type **`>`** in either search bar for commands, completions and inline projects, review and history. **`>preview`**
+refreshes groups without filing, **`>sort`** files ready strong matches once, **`>projects`** browses collections, and
+**`>undo`** restores the latest undoable move. Arrow keys choose commands, Tab completes, Return runs, and Escape
+returns to file search. Typing a command performs no action. See [the full command list](docs/ORGANIZER.md#search-bar-commands).
+
+Use **Settings → Organizer** to include Desktop, Documents or other folders, rename collections, or disable new folder
+creation. Uncertain and individual unmatched files stay for review. Each move is recorded on disk; **Undo** restores an
+unchanged file when its original location is free, including after restarting the app. Returned files are excluded from
+automatic refiling.
 
 Folder setup and automatic filing are off on a fresh installation. This first version organizes the file types Redig
 can index; it does not rearrange code repositories, apps, archives or cloud-only placeholders. Everything runs locally

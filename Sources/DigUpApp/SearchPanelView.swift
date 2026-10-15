@@ -26,17 +26,27 @@ struct SearchPanelView: View {
     private var header: some View {
         HStack(spacing: 11) {
             // A search of code shows it: the field's magnifier becomes code's mark.
-            Image(systemName: controller.isCode ? FileKind.code.symbol : "magnifyingglass")
+            Image(systemName: controller.isCommandMode ? "terminal" : controller.isCode ? FileKind.code.symbol : "magnifyingglass")
                 .font(.system(size: controller.isCode ? 17 : 20, weight: .semibold))
                 .foregroundStyle(Brand.gradient)
                 .frame(width: 24)
                 .help(controller.isCode ? "Searching your code" : "")
             // With code search on, one example is code's: nothing else in the panel shows "code:".
             SearchField(text: $controller.query, fontSize: 22,
-                        placeholder: controller.model.hasCode
-                            ? "Describe it: “zebra in a video”, “code: retry with backoff”…"
-                            : "Describe it: “payment error screenshot”, “zebra in a video”…") {
+                        placeholder: "Search files, or type > for commands…") {
                 controller.field = $0
+            }
+            if controller.query.isEmpty {
+                Button {
+                    controller.setCommandQuery(">")
+                } label: {
+                    Text(">").font(.system(size: 14, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary).padding(.horizontal, 7).padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                .help("Commands: organize, sort, projects, undo…")
+                .accessibilityLabel("Show Redig commands")
             }
             if controller.phase == .words, controller.encoder == .starting {
                 ProgressView().controlSize(.small)
@@ -56,7 +66,9 @@ struct SearchPanelView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if controller.phase == .codeHint || controller.phase == .codeOff {
+        if controller.isCommandMode {
+            CommandPaletteView(controller: controller.commands) { controller.setCommandQuery($0) }
+        } else if controller.phase == .codeHint || controller.phase == .codeOff {
             CodeHint(controller: controller)
         } else if controller.results.isEmpty {
             VStack(spacing: 8) {
@@ -119,6 +131,7 @@ struct SearchPanelView: View {
     /// The keys, saying where ↩ and Space go for a page or moment: "↩ Open at 0:06   ␣ Quick Look at 0:06", and for
     /// code, at which line: "↩ Open in Zed at line 12".
     private var keysText: String {
+        if controller.isCommandMode { return "↑↓ Choose   ⇥ Complete   ↩ Run   Esc Search" }
         let row = controller.selectedRow
         if let row, row.kind == .code {
             let line = row.segment == .lines ? " at line \(row.codeLine)" : ""
@@ -131,6 +144,8 @@ struct SearchPanelView: View {
     private var statusText: String {
         if let note = controller.note { return note }
         switch controller.phase {
+        case .commands:
+            return controller.commands.running ? "Running command…" : "Local commands · actions run on Return"
         case .words:
             return controller.encoder == .starting ? "Matching words; meaning search is warming up…" : "Matching words…"
         case .wordsOnly:

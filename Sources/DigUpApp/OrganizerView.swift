@@ -54,6 +54,12 @@ struct OrganizerView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if organizer.roots.isEmpty {
+                Button("Organize Downloads Automatically") { organizer.startDownloadsAutomation() }
+                    .disabled(organizer.busy)
+                Text("Drop related files into Downloads. Redig creates project folders for clear groups and keeps Undo for every move.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Button("Use Downloads, Desktop & Documents") { organizer.enableSuggestedFolders() }
                     .disabled(organizer.busy)
                 Button("Choose Folders…") { organizer.chooseFolders() }
@@ -88,6 +94,19 @@ struct OrganizerView: View {
                 }
             }
             .disabled(!organizer.enabled)
+            Toggle(isOn: Binding(get: { organizer.createProjectFolders }, set: { organizer.setCreateProjectFolders($0) })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Create project folders automatically")
+                    Text("Strong groups of related files get their own folder in Redig Organized. No existing project folder is needed.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .disabled(!organizer.enabled || !organizer.automaticMoves)
+            Text("Press ⇧⌘Space and type > for commands, preview, projects and Undo.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
         }
     }
 
