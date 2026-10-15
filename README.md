@@ -184,7 +184,7 @@ Tools, switch to Xcode first (`sudo xcode-select -s /Applications/Xcode.app`): t
 macros the build needs.
 
 ```sh
-    git clone https://github.com/100xA/DigUp && cd DigUp
+git clone https://github.com/100xA/DigUp && cd DigUp
 scripts/build-llama.sh            # llama.cpp at a pinned tag, with a one-line patch (a few minutes)
 swift build -c release && swift test
 ./build.sh                        # → build.noindex/DigUp.app
